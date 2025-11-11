@@ -1,4 +1,6 @@
 from mmengine.dataset import DefaultSampler
+from mmdet.datasets.transforms import LoadPanopticAnnotations, RandomFlip, RandomCrop, PackDetInputs, Resize
+
 from seg.datasets.ref_seg import RefSegDataset
 
 data_root = 'data/'
@@ -8,11 +10,11 @@ image_size = (256, 256)
 train_pipeline = [
     dict(type='LoadImageFromFile', to_float32=True, backend_args=backend_args),
     dict(
-        type='LoadPanopticAnnotations',
+        type=LoadPanopticAnnotations,
         with_bbox=True, with_mask=True, with_seg=False, backend_args=backend_args
     ),
     dict(type='Resize', scale=image_size, keep_ratio=True),
-    dict(type='PackDetInputs',
+    dict(type=PackDetInputs,
          meta_keys=('img_id','img_path','ori_shape','img_shape','scale_factor'))
 ]
 

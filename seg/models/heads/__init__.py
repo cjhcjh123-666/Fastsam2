@@ -1,5 +1,4 @@
 from .mask2former_vid import Mask2FormerVideoHead
-from .rapsam_head import RapSAMVideoHead
 from .fastsam2_head import Fastsam2VideoHead
 # from .sam_clip_distill import BackboneDistillation
 # from .sam import SAM

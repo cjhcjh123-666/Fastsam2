@@ -7,6 +7,7 @@ description: 新增文本交互数据集，按 mmengine 格式返回 img_path/in
 from mmdet.registry import DATASETS
 from mmengine.fileio import list_from_file, load
 from mmdet.datasets.base_det_dataset import BaseDetDataset
+import json
 
 @DATASETS.register_module()
 class RefSegDataset(BaseDetDataset):
@@ -19,7 +20,7 @@ class RefSegDataset(BaseDetDataset):
         lines = list_from_file(self.ann_file)
         data_list = []
         for line in lines:
-            item = load(line, file_format='json')
+            item = json.loads(line)
             data_info = dict(
                 img_path=item['img_path'],
                 img_id=0,

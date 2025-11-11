@@ -144,7 +144,7 @@ class LiteDeformConv(nn.Module):
 
 
 @MODELS.register_module()
-class YOSONeck(nn.Module):
+class Fastsam2Neck(nn.Module):
 
     def __init__(self,
                  agg_dim,

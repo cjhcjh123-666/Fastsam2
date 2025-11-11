@@ -13,9 +13,9 @@ from seg.models.heads.fastsam2_head import Fastsam2VideoHead
 from seg.models.detectors.fastsam2 import Fastsam2
 
 with read_base():
-    from .._base_.default_runtime import *
-    from .._base_.datasets.toy_refseg import *
-    from .._base_.schedules.schedule_12e import *
+    from ..._base_.default_runtime import *
+    from ..._base_.datasets.toy_refseg import *
+    from ..._base_.schedules.schedule_12e import *
 
 batch_augments = [
     dict(
@@ -68,7 +68,7 @@ model = dict(
         type=Fastsam2VideoHead,
         prompt_with_kernel_updator=False,
         panoptic_with_kernel_updator=True,
-        use_adaptor=True,
+        use_adaptor=False,
         use_kernel_updator=True,
         sphere_cls=False,
         ov_classifier_name=None,
@@ -138,5 +138,9 @@ model = dict(
 val_dataloader = None
 val_evaluator = None
 val_cfg = None
+
+test_dataloader=None
+test_cfg=None   
+test_evaluator=None
 
 
