@@ -34,11 +34,6 @@ train_dataloader = dict(
                 dataset=_coco_vid_train_loader.dataset,
                 times=1,
             ),
-            # dict(
-            #     type=RepeatDataset,
-            #     dataset=_ade_train_loader.dataset,
-            #     times=1,
-            # ),
             dict(
                 type=RepeatDataset,
                 dataset=_yt19_train_loader.dataset,

@@ -34,6 +34,20 @@ from mmcv.cnn.bricks.transformer import FFN, MultiheadAttention
 from .mask2former_vid import Mask2FormerVideoHead
 from .yoso_head import CrossAttenHead, KernelUpdator
 
+class PromptFusion(nn.Module):
+    def __init__(self, q_dim: int, t_dim: int = 512, hidden: int = 256):
+        super().__init__()
+        self.gamma = nn.Sequential(nn.Linear(t_dim, hidden), nn.ReLU(True),
+                                   nn.Linear(hidden, q_dim))
+        self.beta  = nn.Sequential(nn.Linear(t_dim, hidden), nn.ReLU(True),
+                                   nn.Linear(hidden, q_dim))
+
+    def forward(self, query_feat: Tensor, z_text: Tensor) -> Tensor:
+        # query_feat: [B, Q, C], z_text: [B, D]
+        g = self.gamma(z_text).unsqueeze(1)  # [B, 1, C]
+        b = self.beta(z_text).unsqueeze(1)   # [B, 1, C]
+        return query_feat * (1 + g) + b
+
 @MODELS.register_module()
 class RapSAMVideoHead(Mask2FormerVideoHead):
 
@@ -142,6 +156,16 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         self.loss_mask = MODELS.build(loss_mask)
         self.loss_dice = MODELS.build(loss_dice)
         
+        # -------- Text alignment (lightweight) --------
+        # lazy-inited adapter for text encoding
+        self.text_adapter = None
+        # project mask pooled feature to CLIP text space (default 512-d)
+        self.text_proj = nn.Linear(feat_channels, 512, bias=False)
+        # loss/logit weights can be overridden via cfg
+        self.text_loss_weight = kwargs.get('text_loss_weight', 0.5)
+        self.text_logits_weight = kwargs.get('text_logits_weight', 0.3)
+        # prompt fusion (lazy build after first forward when dim known)
+        self.prompt_fusion = None
 
     def init_weights(self) -> None:
         pass
@@ -164,6 +188,9 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         all_cls_scores = []
         all_masks_preds = []
         all_iou_preds = []
+        # cache features for text loss usage
+        self._last_mask_features = None
+        self._last_num_frames = 0
         if self.prompt_training:
             input_query_label, input_query_bbox, self_attn_mask, mask_dict = self.prepare_for_dn_mo(
                 batch_data_samples)
@@ -173,10 +200,30 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         else:
             object_kernels = self.kernels.weight[None].repeat(bs, 1, 1)
             self_attn_mask = None
+        # PromptFusion: apply text modulation to queries if available
+        try:
+            z_text, idxs = self._get_text_embeddings(batch_data_samples)
+            if z_text is not None:
+                # build batch-aligned z_text [B, D]
+                D = z_text.shape[-1]
+                z_batch = torch.zeros((bs, D), device=z_text.device, dtype=z_text.dtype)
+                for b in range(bs):
+                    # use matching index if provided, otherwise clamp
+                    z_idx = b if b < z_text.shape[0] else (z_text.shape[0] - 1)
+                    z_batch[b] = z_text[z_idx]
+                if self.prompt_fusion is None:
+                    self.prompt_fusion = PromptFusion(q_dim=object_kernels.shape[-1], t_dim=D)
+                    self.prompt_fusion.to(object_kernels.device)
+                object_kernels = self.prompt_fusion(object_kernels, z_batch)
+        except Exception:
+            pass
         mask_features = x
         if num_frames > 0: # (bs*num_frames, c, h, w) -> (bs, c, num_frames*h, w)
             mask_features = mask_features.unflatten(0, (bs, num_frames))
             mask_features = mask_features.transpose(1, 2).flatten(2, 3)
+        # cache single/multi frame aware features
+        self._last_mask_features = mask_features
+        self._last_num_frames = num_frames
         
         mask_preds = torch.einsum('bnc,bchw->bnhw', object_kernels, mask_features)
         for stage in range(self.num_stages):
@@ -236,6 +283,45 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                 all_cls_scores.append(all_cls_scores[-1])
                 all_iou_preds.append(iou_preds)
         return all_cls_scores, all_masks_preds, all_iou_preds, object_kernels
+
+    # -------- helper: ensure text adapter --------
+    def _ensure_text_adapter(self):
+        if getattr(self, 'text_adapter', None) is not None:
+            return
+        try:
+            # prefer local ext.open_clip if available in repo
+            import ext.open_clip  # noqa: F401
+        except Exception:
+            pass
+        from seg.models.utils.text_prompt_adapter import TextPromptAdapter
+        self.text_adapter = TextPromptAdapter(model_name='ViT-B-32', pretrained='openai')
+
+    # -------- helper: collect text list and encode --------
+    def _get_text_embeddings(self, batch_data_samples):
+        texts = []
+        idxs = []
+        # TrackDataSample or standard DetDataSample handling
+        if isinstance(batch_data_samples[0], TrackDataSample):
+            # take first frame's text if exists per track sample
+            for i, track in enumerate(batch_data_samples):
+                t = None
+                for det_sample in track:
+                    if hasattr(det_sample, 'text') and det_sample.text:
+                        t = det_sample.text
+                        break
+                if t:
+                    texts.append(t if isinstance(t, str) else str(t))
+                    idxs.append(i)
+        else:
+            for i, sample in enumerate(batch_data_samples):
+                if hasattr(sample, 'text') and sample.text:
+                    texts.append(sample.text if isinstance(sample.text, str) else str(sample.text))
+                    idxs.append(i)
+        if len(texts) == 0:
+            return None, None
+        self._ensure_text_adapter()
+        z = self.text_adapter.encode(texts)  # [M, D], normalized
+        return z, idxs
 
     def _loss_by_feat_single(self, cls_scores, mask_preds, iou_preds, batch_gt_instances, batch_img_metas):
         batch_size, num_ins = cls_scores.size(0), cls_scores.size(1)
@@ -382,3 +468,165 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                 for n, p in self.prompt_iou.named_parameters():
                     loss_iou += p.sum() * 0.0
             return loss_cls, loss_mask, loss_dice, loss_iou
+
+        # 1) 文本向量获取（单例缓存）
+    # 追加全文本对齐损失在 loss() 中实现
+
+    def loss(
+            self,
+            x: Tuple[Tensor],
+            batch_data_samples: SampleList,
+    ) -> Dict[str, Tensor]:
+        # largely follows Mask2FormerVideoHead.loss with augmentation to add text loss
+        batch_img_metas = []
+        batch_gt_instances = []
+        batch_gt_semantic_segs = []
+        for data_sample in batch_data_samples:
+            if isinstance(data_sample, TrackDataSample):
+                clip_meta = []
+                clip_instances = []
+                clip_sem_seg = []
+                for det_sample in data_sample:
+                    clip_meta.append(det_sample.metainfo)
+                    clip_instances.append(det_sample.gt_instances)
+                    if 'gt_sem_seg' in det_sample:
+                        clip_sem_seg.append(det_sample.gt_sem_seg)
+                    else:
+                        clip_sem_seg.append(None)
+                batch_img_metas.append(clip_meta)
+                batch_gt_instances.append(clip_instances)
+                batch_gt_semantic_segs.append(clip_sem_seg)
+            else:
+                batch_img_metas.append(data_sample.metainfo)
+                batch_gt_instances.append(data_sample.gt_instances)
+                if 'gt_sem_seg' in data_sample:
+                    batch_gt_semantic_segs.append(data_sample.gt_sem_seg)
+                else:
+                    batch_gt_semantic_segs.append(None)
+
+        # forward
+        all_cls_scores, all_mask_preds, all_iou_preds, _ = self(x, batch_data_samples)
+
+        # preprocess ground truth
+        if not self.enable_box_query or batch_data_samples[0].data_tag in ['coco', 'sam']:
+            batch_gt_instances = self.preprocess_gt(batch_gt_instances, batch_gt_semantic_segs)
+
+        # video flatten handling
+        if isinstance(batch_data_samples[0], TrackDataSample):
+            num_frames = len(batch_img_metas[0])
+            all_mask_preds = [mask.flatten(2, 3) for mask in all_mask_preds]
+            for instance in batch_gt_instances:
+                instance['masks'] = instance['masks'].flatten(1, 2)
+            film_metas = [
+                {
+                    'img_shape': (meta[0]['img_shape'][0] * num_frames,
+                                  meta[0]['img_shape'][1])
+                } for meta in batch_img_metas
+            ]
+            batch_img_metas = film_metas
+
+        # base losses (cls/mask/dice/optional iou)
+        losses = self.loss_by_feat(all_cls_scores, all_mask_preds, batch_gt_instances, batch_img_metas)
+
+        if self.enable_box_query:
+            # zero reg to keep dn params in graph similar to parent impl
+            losses['loss_zero'] = 0 * self.kernels.weight.sum() + 0 * self.mask_tokens.weight.sum()
+            losses['loss_zero'] += 0 * self.pb_embedding.weight.sum()
+            losses['loss_zero'] += 0 * self.pos_linear.weight.sum() + 0 * self.pos_linear.bias.sum()
+
+        # -------- add lightweight text loss on non-video for stability --------
+        try:
+            # only apply when there is text and single frame path (for simplicity first)
+            z_text, idxs = self._get_text_embeddings(batch_data_samples)
+            if (z_text is not None) and (getattr(self, '_last_num_frames', 0) == 0):
+                # last stage preds [B, Q, H, W]
+                mask_pred_last = all_mask_preds[-1]
+                # cached mask features [B, C, H, W]
+                mask_features = self._last_mask_features
+                if mask_features is not None and mask_pred_last.dim() == 4:
+                    # pooled features: [B, Q, C]
+                    f_mask = mask_pool(mask_features, mask_pred_last)
+                    # project to text space and compute per-image sim logits
+                    B, Q, C = f_mask.shape
+                    f_proj = self.text_proj(f_mask)
+                    f_proj = f_proj / (f_proj.norm(dim=-1, keepdim=True) + 1e-6)
+                    sim_logits = []
+                    for b in range(B):
+                        z = z_text[b] if b < z_text.shape[0] else z_text[-1]
+                        sim = torch.matmul(f_proj[b], z)  # [Q]
+                        sim_logits.append(sim)
+                    sim_logits = torch.stack(sim_logits, 0)  # [B, Q]
+                    # construct simple positives: use highest mask response as positive per image
+                    with torch.no_grad():
+                        pos_idx = mask_pred_last.sigmoid().mean(dim=(2, 3)).argmax(dim=1)  # [B]
+                        target = torch.zeros_like(sim_logits)
+                        target[torch.arange(sim_logits.size(0), device=sim_logits.device), pos_idx] = 1.0
+                    bce = torch.nn.functional.binary_cross_entropy_with_logits(sim_logits, target)
+                    losses['loss_text'] = bce * float(self.text_loss_weight)
+        except Exception:
+            # be conservative: do not break training if text branch fails
+            pass
+
+        return losses
+
+    def predict(self, x: Tuple[Tensor],
+                batch_data_samples: SampleList,
+                return_query=False,
+                ) -> Tuple[Tensor, ...]:
+        # largely mirror parent predict() and inject text re-ranking before return
+        data_sample = batch_data_samples[0]
+        if isinstance(data_sample, TrackDataSample):
+            img_shape = data_sample[0].metainfo['batch_input_shape']
+            num_frames = len(data_sample)
+        else:
+            img_shape = data_sample.metainfo['batch_input_shape']
+            num_frames = 0
+        all_cls_scores, all_mask_preds, all_iou_preds, _ = self(x, batch_data_samples)
+        mask_cls_results = all_cls_scores[-1]
+        mask_pred_results = all_mask_preds[-1]
+        iou_results = all_iou_preds[-1] if (all_iou_preds is not None and len(all_iou_preds) > 0) else None
+
+        if num_frames > 0:
+            mask_pred_results = mask_pred_results.flatten(1, 2)
+        mask_pred_results = F.interpolate(
+            mask_pred_results,
+            size=(img_shape[0], img_shape[1]),
+            mode='bilinear',
+            align_corners=False)
+        if num_frames > 0:
+            num_queries = mask_cls_results.shape[1]
+            mask_pred_results = mask_pred_results.unflatten(1, (num_queries, num_frames))
+
+        # inject text-based re-ranking on single frame path
+        try:
+            z_text, idxs = self._get_text_embeddings(batch_data_samples)
+            if (z_text is not None) and (getattr(self, '_last_num_frames', 0) == 0):
+                mask_features = self._last_mask_features  # [B, C, H, W]
+                if mask_features is not None and mask_pred_results.dim() == 4:
+                    f_mask = mask_pool(mask_features, mask_pred_results)  # [B, Q, C]
+                    f_proj = self.text_proj(f_mask)
+                    f_proj = f_proj / (f_proj.norm(dim=-1, keepdim=True) + 1e-6)
+                    B, Q, D = f_proj.shape
+                    sim_logits = []
+                    for b in range(B):
+                        z = z_text[b] if b < z_text.shape[0] else z_text[-1]
+                        sim = torch.matmul(f_proj[b], z)  # [Q]
+                        sim_logits.append(sim)
+                    sim_logits = torch.stack(sim_logits, 0).unsqueeze(-1)  # [B, Q, 1]
+                    # add to classification logits (background-aware if last dim matches)
+                    if mask_cls_results.shape[-1] == 1:
+                        mask_cls_results = mask_cls_results + self.text_logits_weight * sim_logits
+                    else:
+                        # add to foreground channels uniformly; here apply to all channels
+                        mask_cls_results = mask_cls_results + self.text_logits_weight * sim_logits
+        except Exception:
+            pass
+
+        if iou_results is None:
+            return mask_cls_results, mask_pred_results
+
+        if return_query:
+            # we do not expose query_feat here; keep signature compatible
+            return mask_cls_results, mask_pred_results, None, iou_results
+        else:
+            return mask_cls_results, mask_pred_results, iou_results
