@@ -600,10 +600,21 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         # inject text-based re-ranking on single frame path
         try:
             z_text, idxs = self._get_text_embeddings(batch_data_samples)
-            if (z_text is not None) and (getattr(self, '_last_num_frames', 0) == 0):
-                mask_features = self._last_mask_features  # [B, C, H, W]
-                if mask_features is not None and mask_pred_results.dim() == 4:
-                    f_mask = mask_pool(mask_features, mask_pred_results)  # [B, Q, C]
+            if z_text is not None:
+                mask_features = self._last_mask_features  # single: [B,C,Hf,Wf]; video: [B,C,num_frames*hf,Wf]
+                if mask_features is not None:
+                    pre_masks = all_mask_preds[-1]
+                    if num_frames > 0 and pre_masks.dim() == 5:
+                        # video path: select middle keyframe for re-ranking
+                        B, Q, T, hf, wf = pre_masks.shape
+                        k = T // 2
+                        # slice feature window corresponding to keyframe vertical band
+                        feat_k = mask_features[:, :, k*hf:(k+1)*hf, :].contiguous()
+                        mask_k = pre_masks[:, :, k, :, :].contiguous()
+                        f_mask = mask_pool(feat_k, mask_k)  # [B, Q, C]
+                    else:
+                        # single frame path
+                        f_mask = mask_pool(mask_features, pre_masks)  # [B, Q, C]
                     f_proj = self.text_proj(f_mask)
                     f_proj = f_proj / (f_proj.norm(dim=-1, keepdim=True) + 1e-6)
                     B, Q, D = f_proj.shape
@@ -613,12 +624,7 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                         sim = torch.matmul(f_proj[b], z)  # [Q]
                         sim_logits.append(sim)
                     sim_logits = torch.stack(sim_logits, 0).unsqueeze(-1)  # [B, Q, 1]
-                    # add to classification logits (background-aware if last dim matches)
-                    if mask_cls_results.shape[-1] == 1:
-                        mask_cls_results = mask_cls_results + self.text_logits_weight * sim_logits
-                    else:
-                        # add to foreground channels uniformly; here apply to all channels
-                        mask_cls_results = mask_cls_results + self.text_logits_weight * sim_logits
+                    mask_cls_results = mask_cls_results + self.text_logits_weight * sim_logits
         except Exception:
             pass
 
