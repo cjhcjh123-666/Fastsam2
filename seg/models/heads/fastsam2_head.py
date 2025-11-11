@@ -175,7 +175,10 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         # streaming memory entry (VOS / video-interactive)
         self.enable_memory = kwargs.get('enable_memory', True)
         self.memory_fuse_weight = kwargs.get('memory_fuse_weight', 0.2)
-        self.memory_adapter = MemoryAdapter(max_len=5)
+        self.memory_topk = kwargs.get('memory_topk', 0)
+        self.memory_use_attention = kwargs.get('memory_use_attention', True)
+        self.keyframe_policy = kwargs.get('keyframe_policy', 'middle')  # 'middle'|'first'|'last'|'avg3'
+        self.memory_adapter = MemoryAdapter(max_len=5, topk=self.memory_topk, use_attention=self.memory_use_attention)
 
     def init_weights(self) -> None:
         pass
@@ -230,7 +233,8 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         # memory fusion for video: bias queries with recent memory summary
         if num_frames > 0 and self.enable_memory:
             try:
-                mem = self.memory_adapter.fetch()
+                # provide current query mean for attention fusion
+                mem = self.memory_adapter.fetch(current_query=object_kernels)
                 if mem is not None:
                     object_kernels = object_kernels + self.memory_fuse_weight * mem.unsqueeze(1).to(object_kernels)
             except Exception:
@@ -278,7 +282,9 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         # update memory with latest query state for next calls (video only)
         if num_frames > 0 and self.enable_memory:
             try:
-                self.memory_adapter.update(object_kernels)
+                # pass iou from last stage for Top-K selection
+                last_iou = all_iou_preds[-1] if (len(all_iou_preds) > 0) else None
+                self.memory_adapter.update(object_kernels, iou_preds=last_iou)
             except Exception:
                 pass
 
@@ -640,7 +646,7 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
             num_queries = mask_cls_results.shape[1]
             mask_pred_results = mask_pred_results.unflatten(1, (num_queries, num_frames))
 
-        # inject text-based re-ranking on single frame path
+        # inject text-based re-ranking (single & video with keyframe policy)
         try:
             z_text, idxs = self._get_text_embeddings(batch_data_samples)
             if z_text is not None:
@@ -648,13 +654,21 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                 if mask_features is not None:
                     pre_masks = all_mask_preds[-1]
                     if num_frames > 0 and pre_masks.dim() == 5:
-                        # video path: select middle keyframe for re-ranking
                         B, Q, T, hf, wf = pre_masks.shape
-                        k = T // 2
-                        # slice feature window corresponding to keyframe vertical band
-                        feat_k = mask_features[:, :, k*hf:(k+1)*hf, :].contiguous()
-                        mask_k = pre_masks[:, :, k, :, :].contiguous()
-                        f_mask = mask_pool(feat_k, mask_k)  # [B, Q, C]
+                        if self.keyframe_policy == 'first':
+                            ks = [0]
+                        elif self.keyframe_policy == 'last':
+                            ks = [T - 1]
+                        elif self.keyframe_policy == 'avg3':
+                            ks = sorted(set([max(0, T // 2 - 1), T // 2, min(T - 1, T // 2 + 1)]))
+                        else:  # 'middle'
+                            ks = [T // 2]
+                        feats = []
+                        for k in ks:
+                            feat_k = mask_features[:, :, k*hf:(k+1)*hf, :].contiguous()
+                            mask_k = pre_masks[:, :, k, :, :].contiguous()
+                            feats.append(mask_pool(feat_k, mask_k))  # [B, Q, C]
+                        f_mask = torch.stack(feats, 0).mean(0)  # [B, Q, C]
                     else:
                         # single frame path
                         f_mask = mask_pool(mask_features, pre_masks)  # [B, Q, C]
