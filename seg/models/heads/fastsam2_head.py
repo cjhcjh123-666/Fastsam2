@@ -166,6 +166,11 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         self.text_logits_weight = kwargs.get('text_logits_weight', 0.3)
         # prompt fusion (lazy build after first forward when dim known)
         self.prompt_fusion = None
+        # dynamic routing & early-exit
+        self.enable_dynamic_routing = kwargs.get('enable_dynamic_routing', True)
+        self.early_exit = kwargs.get('early_exit', True)
+        self.early_iou_thr = kwargs.get('early_iou_thr', 0.90)
+        self.early_delta_thr = kwargs.get('early_delta_thr', 1e-3)
 
     def init_weights(self) -> None:
         pass
@@ -226,6 +231,7 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         self._last_num_frames = num_frames
         
         mask_preds = torch.einsum('bnc,bchw->bnhw', object_kernels, mask_features)
+        prev_mask_preds = None
         for stage in range(self.num_stages):
             mask_head = self.mask_heads[stage]
             cls_scores, mask_preds, iou_preds, object_kernels = mask_head(
@@ -238,6 +244,23 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                 all_masks_preds.append(mask_preds.unflatten(2, (num_frames, -1)))
             else:
                 all_masks_preds.append(mask_preds)
+            # early-exit criterion
+            if self.enable_dynamic_routing and self.early_exit:
+                try:
+                    hit = False
+                    if iou_preds is not None:
+                        conf = torch.sigmoid(iou_preds).mean().item()
+                        if conf >= float(self.early_iou_thr):
+                            hit = True
+                    if (not hit) and (prev_mask_preds is not None):
+                        delta = (mask_preds - prev_mask_preds).abs().mean().item()
+                        if delta <= float(self.early_delta_thr):
+                            hit = True
+                    prev_mask_preds = mask_preds.detach()
+                    if hit:
+                        break
+                except Exception:
+                    pass
         
         if self.use_adaptor:
             keys = mask_features.flatten(2).transpose(1, 2).contiguous()
