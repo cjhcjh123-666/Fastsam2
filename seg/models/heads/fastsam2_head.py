@@ -28,6 +28,7 @@ from mmdet.models.dense_heads.anchor_free_head import AnchorFreeHead
 
 from seg.models.necks import SAMPromptEncoder
 from seg.models.utils import preprocess_video_panoptic_gt, mask_pool
+from seg.models.utils.memory_adapter import MemoryAdapter
 
 from mmcv.cnn.bricks.transformer import FFN, MultiheadAttention
 
@@ -171,6 +172,10 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         self.early_exit = kwargs.get('early_exit', True)
         self.early_iou_thr = kwargs.get('early_iou_thr', 0.90)
         self.early_delta_thr = kwargs.get('early_delta_thr', 1e-3)
+        # streaming memory entry (VOS / video-interactive)
+        self.enable_memory = kwargs.get('enable_memory', True)
+        self.memory_fuse_weight = kwargs.get('memory_fuse_weight', 0.2)
+        self.memory_adapter = MemoryAdapter(max_len=5)
 
     def init_weights(self) -> None:
         pass
@@ -222,6 +227,14 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                 object_kernels = self.prompt_fusion(object_kernels, z_batch)
         except Exception:
             pass
+        # memory fusion for video: bias queries with recent memory summary
+        if num_frames > 0 and self.enable_memory:
+            try:
+                mem = self.memory_adapter.fetch()
+                if mem is not None:
+                    object_kernels = object_kernels + self.memory_fuse_weight * mem.unsqueeze(1).to(object_kernels)
+            except Exception:
+                pass
         mask_features = x
         if num_frames > 0: # (bs*num_frames, c, h, w) -> (bs, c, num_frames*h, w)
             mask_features = mask_features.unflatten(0, (bs, num_frames))
@@ -262,6 +275,13 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                 except Exception:
                     pass
         
+        # update memory with latest query state for next calls (video only)
+        if num_frames > 0 and self.enable_memory:
+            try:
+                self.memory_adapter.update(object_kernels)
+            except Exception:
+                pass
+
         if self.use_adaptor:
             keys = mask_features.flatten(2).transpose(1, 2).contiguous()
             if not self.prompt_training:
