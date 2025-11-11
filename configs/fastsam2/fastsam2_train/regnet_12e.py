@@ -15,7 +15,7 @@ from seg.models.detectors.fastsam2 import Fastsam2
 
 with read_base():
     from .._base_.default_runtime import *
-    from .._base_.datasets.coco_panoptic_video_yt19_vip_cityscapes_cocopansam import *
+    from .._base_.datasets.fastsam2 import *
     from .._base_.schedules.schedule_12e import *
 
 batch_augments = [
@@ -78,6 +78,18 @@ model = dict(
         num_things_classes=num_things_classes,
         num_stuff_classes=num_stuff_classes,
         num_queries=100,
+        # text alignment & routing & memory
+        text_loss_weight=0.5,
+        text_logits_weight=0.3,
+        enable_dynamic_routing=True,
+        early_exit=True,
+        early_iou_thr=0.90,
+        early_delta_thr=1e-3,
+        enable_memory=True,
+        memory_topk=10,
+        memory_use_attention=True,
+        memory_fuse_weight=0.2,
+        keyframe_policy='middle',
         loss_cls=dict(
             type=CrossEntropyLoss,
             use_sigmoid=False,
