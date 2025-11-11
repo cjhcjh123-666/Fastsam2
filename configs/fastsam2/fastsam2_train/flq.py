@@ -1,20 +1,22 @@
 from mmengine.config import read_base
 from torch.nn import GroupNorm, ReLU
 
-from mmdet.models import BatchFixedSizePad, CrossEntropyLoss, DiceLoss, MaskFormerFusionHead
+from mmdet.models import BatchFixedSizePad, MSDeformAttnPixelDecoder, CrossEntropyLoss, \
+    DiceLoss, MaskFormerFusionHead, FocalLoss
 from mmdet.models.task_modules.assigners import HungarianAssigner, CrossEntropyLossCost, DiceCost
 from mmdet.models.task_modules.samplers import MaskPseudoSampler
 
 from seg.models.data_preprocessor import OVSAMVideoSegDataPreprocessor
 from seg.models.utils import NO_OBJ
+from seg.models.backbones.openclip_backbone import OpenCLIPBackbone
 from seg.models.task_modules.cost import FlexibleClassificationCost
 from seg.models.necks.fastsam2_neck import Fastsam2Neck
-from seg.models.heads.fastsam2_head import Fastsam2VideoHead
+from seg.models.heads.fastsam2_head import FastSAM2VideoHead
 from seg.models.detectors.fastsam2 import Fastsam2
 
 with read_base():
     from ..._base_.default_runtime import *
-    from ..._base_.datasets.toy_refseg import *
+    from ..._base_.datasets.fastsam2 import *
     from ..._base_.schedules.schedule_12e import *
 
 batch_augments = [
@@ -40,43 +42,44 @@ data_preprocessor = dict(
     seg_pad_value=NO_OBJ,
     batch_augments=batch_augments,
     use_point_pseudo_box=True,
-    num_proposals=10,
+    num_proposals=20,
 )
 
-num_things_classes = 1
-num_stuff_classes = 0
+num_things_classes = 136
+num_stuff_classes = 101
 num_classes = num_things_classes + num_stuff_classes
 model = dict(
     type=Fastsam2,
     data_preprocessor=data_preprocessor,
     backbone=dict(
-        type='RegNet',
-        arch='regnetx_400mf',
-        out_indices=(0, 1, 2, 3),
-        frozen_stages=-1,
-        norm_cfg=dict(type='BN', requires_grad=True),
-        norm_eval=False,
-        init_cfg=None
+        type=OpenCLIPBackbone,
+        model_name='convnext_large_d_320',
+        fix=True,
+        init_cfg=dict(
+            type='clip_pretrain',
+            checkpoint='laion2b_s29b_b131k_ft_soup'
+        )
     ),
     neck=dict(
         type=Fastsam2Neck,
-        agg_dim=64,
-        hidden_dim=128,
-        backbone_shape=[24, 56, 152, 368],
+        agg_dim=128,
+        hidden_dim=256,
+        backbone_shape=[192, 384, 768, 1536],
     ),
     panoptic_head=dict(
-        type=Fastsam2VideoHead,
+        type=FastSAM2VideoHead,
         prompt_with_kernel_updator=False,
         panoptic_with_kernel_updator=True,
-        use_adaptor=False,
+        use_adaptor=True,
         use_kernel_updator=True,
-        sphere_cls=False,
-        ov_classifier_name=None,
-        num_stages=2,
-        feat_channels=128,
+        sphere_cls=True,
+        ov_classifier_name='convnext_large_d_320_Concat_CocoPanopticOVDataset_YouTubeVISDataset_2019_VIPSegDataset_CityscapesPanopticDataset',
+        num_stages=3,
+        feat_channels=256,
         num_things_classes=num_things_classes,
         num_stuff_classes=num_stuff_classes,
-        num_queries=20,
+        num_queries=100,
+        # text alignment & routing & memory
         text_loss_weight=0.5,
         text_logits_weight=0.3,
         enable_dynamic_routing=True,
@@ -84,7 +87,7 @@ model = dict(
         early_iou_thr=0.90,
         early_delta_thr=1e-3,
         enable_memory=True,
-        memory_topk=5,
+        memory_topk=10,
         memory_use_attention=True,
         memory_fuse_weight=0.2,
         keyframe_policy='middle',
@@ -93,7 +96,7 @@ model = dict(
             use_sigmoid=False,
             loss_weight=2.0,
             reduction='mean',
-            class_weight=[1.0] * (num_classes + 1)),
+            class_weight=[1.0] * num_classes + [0.1]),
         loss_mask=dict(
             type=CrossEntropyLoss,
             use_sigmoid=True,
@@ -107,7 +110,7 @@ model = dict(
             naive_dice=True,
             eps=1.0,
             loss_weight=5.0)),
-
+    
     panoptic_fusion_head=dict(
         type=MaskFormerFusionHead,
         num_things_classes=num_things_classes,
@@ -115,7 +118,7 @@ model = dict(
         loss_panoptic=None,
         init_cfg=None),
     train_cfg=dict(
-        num_points=4096,
+        num_points=12544,
         oversample_ratio=3.0,
         importance_sample_ratio=0.75,
         assigner=dict(
@@ -127,20 +130,23 @@ model = dict(
             ]),
         sampler=dict(type=MaskPseudoSampler)),
     test_cfg=dict(
-        panoptic_on=False,
+        panoptic_on=True,
+        # For now, the dataset does not support
+        # evaluating semantic segmentation metric.
         semantic_on=False,
         instance_on=True,
-        max_per_image=20,
+        # max_per_image is for instance segmentation.
+        max_per_image=100,
         iou_thr=0.8,
+        # In Mask2Former's panoptic postprocessing,
+        # it will filter mask area where score is less than 0.5 .
         filter_low_score=True),
+    # init_cfg=dict(
+    #     type='Pretrained',
+    #     checkpoint='work_dirs/m2_300q_convl_vlm_fix_4e_ov_obj365/epoch_4.pth'
+    # )
 )
 
 val_dataloader = None
 val_evaluator = None
 val_cfg = None
-
-test_dataloader=None
-test_cfg=None   
-test_evaluator=None
-
-

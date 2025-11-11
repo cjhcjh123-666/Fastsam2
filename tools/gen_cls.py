@@ -18,7 +18,8 @@ from mmdet.utils import setup_cache_size_limit_of_dynamo
 from mmengine.dist import get_dist_info
 
 from ext.templates import VILD_PROMPT
-
+from mmdet.utils import register_all_modules
+register_all_modules()
 
 def split_label(x: str) -> List[str]:
     x = x.replace('_or_', ',')

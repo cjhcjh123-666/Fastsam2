@@ -37,7 +37,8 @@ train_dataloader = dict(
     dataset=dict(
         type=RefSegDataset,
         data_root=data_root,
-        ann_file='refcoco/converted/refcoco_train.jsonl',  # 或者指向 data/ref_seg/*.jsonl
+        # 直接指向 HF 的 ref_seg 目录，内部自动递归解析 *.jsonl/*.json
+        ann_file='ref_seg',
         pipeline=train_pipeline_ref,
         backend_args=backend_args
     )

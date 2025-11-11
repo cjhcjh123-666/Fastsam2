@@ -1,5 +1,5 @@
 from .mask2former_vid import Mask2FormerVideoHead
-from .fastsam2_head import Fastsam2VideoHead
+from .fastsam2_head import FastSAM2VideoHead
 # from .sam_clip_distill import BackboneDistillation
 # from .sam import SAM
 # from .sam_backbone_feats import SAMBF

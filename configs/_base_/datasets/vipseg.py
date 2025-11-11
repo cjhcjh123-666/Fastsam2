@@ -10,7 +10,7 @@ from seg.datasets.vipseg import VIPSegDataset
 from seg.evaluation.metrics.vip_seg_metric import VIPSegMetric
 
 dataset_type = VIPSegDataset
-data_root = 'data/VIPSeg'
+data_root = 'data/VIPSeg/'
 
 backend_args = None
 image_size = (1280, 736)

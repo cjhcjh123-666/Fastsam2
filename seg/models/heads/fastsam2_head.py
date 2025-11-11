@@ -50,7 +50,7 @@ class PromptFusion(nn.Module):
         return query_feat * (1 + g) + b
 
 @MODELS.register_module()
-class Fastsam2VideoHead(Mask2FormerVideoHead):
+class FastSAM2VideoHead(Mask2FormerVideoHead):
 
     def __init__(self,
                  frozen_head=False,

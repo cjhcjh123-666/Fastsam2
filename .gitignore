@@ -120,6 +120,7 @@ venv.bak/
 docs/modelzoo_statistics.md
 mmdet/.mim
 work_dirs/
+data/
 
 # Pytorch
 *.pth

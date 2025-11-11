@@ -10,13 +10,13 @@ from seg.models.data_preprocessor import OVSAMVideoSegDataPreprocessor
 from seg.models.utils import NO_OBJ
 from seg.models.task_modules.cost import FlexibleClassificationCost
 from seg.models.necks.fastsam2_neck import Fastsam2Neck
-from seg.models.heads.fastsam2_head import Fastsam2VideoHead
+from seg.models.heads.fastsam2_head import FastSAM2VideoHead
 from seg.models.detectors.fastsam2 import Fastsam2
 
 with read_base():
-    from .._base_.default_runtime import *
-    from .._base_.datasets.fastsam2 import *
-    from .._base_.schedules.schedule_12e import *
+    from ..._base_.default_runtime import *
+    from ..._base_.datasets.fastsam2 import *
+    from ..._base_.schedules.schedule_12e import *
 
 batch_augments = [
     dict(
@@ -66,7 +66,7 @@ model = dict(
         backbone_shape=[224, 448, 896, 1920],
     ),
     panoptic_head=dict(
-        type=Fastsam2VideoHead,
+        type=FastSAM2VideoHead,
         prompt_with_kernel_updator=False,
         panoptic_with_kernel_updator=True,
         use_adaptor=True,
