@@ -27,7 +27,7 @@ train_dataloader = dict(
     batch_sampler=dict(type=VideoSegAspectRatioBatchSampler),
     dataset=dict(
         type=ConcatOVDataset,
-        data_tag=['coco', 'coco', 'coco', 'coco', 'coco', 'sam', 'text'],
+        data_tag=['coco', 'coco', 'coco', 'coco', 'coco', 'sam'],
         datasets=[
             dict(
                 type=RepeatDataset,
