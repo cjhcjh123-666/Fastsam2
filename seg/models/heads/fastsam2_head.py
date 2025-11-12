@@ -81,6 +81,9 @@ class FastSAM2VideoHead(Mask2FormerVideoHead):
         self.prompt_with_kernel_updator = prompt_with_kernel_updator
         self.panoptic_with_kernel_updator = panoptic_with_kernel_updator
         self.use_adaptor = use_adaptor
+        # Whether to enable prompt training (denoising queries etc.)
+        # Default to False to avoid attribute error when not configured.
+        self.prompt_training = bool(kwargs.get('prompt_training', False))
 
         self.num_mask_tokens = num_mask_tokens
         self.mask_tokens = nn.Embedding(num_mask_tokens, feat_channels)
@@ -575,7 +578,7 @@ class FastSAM2VideoHead(Mask2FormerVideoHead):
             batch_img_metas = film_metas
 
         # base losses (cls/mask/dice/optional iou)
-        losses = self.loss_by_feat(all_cls_scores, all_mask_preds, batch_gt_instances, batch_img_metas)
+        losses = self.loss_by_feat(all_cls_scores, all_mask_preds, all_iou_preds, batch_gt_instances, batch_img_metas)
 
         if self.enable_box_query:
             # zero reg to keep dn params in graph similar to parent impl

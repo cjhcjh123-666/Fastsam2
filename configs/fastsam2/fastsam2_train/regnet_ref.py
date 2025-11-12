@@ -15,7 +15,7 @@ from seg.models.detectors.fastsam2 import Fastsam2
 
 with read_base():
     from ..._base_.default_runtime import *
-    from ..._base_.datasets.fastsam2 import *
+    from ..._base_.datasets.ref_seg import *
     from ..._base_.schedules.schedule_12e import *
 
 batch_augments = [
@@ -25,7 +25,7 @@ batch_augments = [
         img_pad_value=0,
         pad_mask=True,
         mask_pad_value=0,
-        pad_seg=True,
+        pad_seg=False,
         seg_pad_value=NO_OBJ
     )
 ]
@@ -37,14 +37,14 @@ data_preprocessor = dict(
     pad_size_divisor=32,
     pad_mask=True,
     mask_pad_value=0,
-    pad_seg=True,
+    pad_seg=False,
     seg_pad_value=NO_OBJ,
     batch_augments=batch_augments,
     use_point_pseudo_box=True,
     num_proposals=20,
 )
 
-num_things_classes = 136
+num_things_classes = 139
 num_stuff_classes = 101
 num_classes = num_things_classes + num_stuff_classes
 model = dict(
@@ -63,10 +63,13 @@ model = dict(
         type=Fastsam2Neck,
         agg_dim=128,
         hidden_dim=256,
-        backbone_shape=[224, 448, 896, 1920],
+        backbone_shape=[224, 448, 896, 2240],
     ),
     panoptic_head=dict(
         type=FastSAM2VideoHead,
+
+        prompt_training=False,
+        
         prompt_with_kernel_updator=False,
         panoptic_with_kernel_updator=True,
         use_adaptor=True,
@@ -149,3 +152,9 @@ model = dict(
 val_dataloader = None
 val_evaluator = None
 val_cfg = None
+
+test_dataloader = None
+test_evaluator = None
+test_cfg = None
+
+find_unused_parameters = True
