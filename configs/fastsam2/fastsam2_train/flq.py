@@ -45,7 +45,7 @@ data_preprocessor = dict(
     num_proposals=20,
 )
 
-num_things_classes = 136
+num_things_classes = 139
 num_stuff_classes = 101
 num_classes = num_things_classes + num_stuff_classes
 model = dict(

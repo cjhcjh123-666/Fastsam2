@@ -38,12 +38,6 @@ train_pipeline = [
         crop_type='absolute',
         recompute_bbox=True,
         allow_negative_crop=True),
-    dict(
-        type=FilterAnnotationsHB,
-        by_box=False,
-        by_mask=True,
-        min_gt_mask_area=32,
-    ),
     dict(type=PackDetInputs)
 ]
 train_dataloader = dict(

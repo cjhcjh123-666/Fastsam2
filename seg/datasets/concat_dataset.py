@@ -51,7 +51,7 @@ class ConcatOVDataset(ConcatDataset, ABC):
         stuff_classes = []
         stuff_mapper = []
         for idx, dataset in enumerate(self.datasets):
-            if 'classes' not in dataset.metainfo or (self.data_tag is not None and self.data_tag[idx] in ['sam']):
+            if 'classes' not in dataset.metainfo or (self.data_tag is not None and self.data_tag[idx] in ['sam', 'text']):
                 # class agnostic dataset
                 _thing_mapper = {}
                 _stuff_mapper = {}
@@ -65,8 +65,10 @@ class ConcatOVDataset(ConcatDataset, ABC):
             _stuff_mapper = {}
             for idy, cls in enumerate(_thing_classes):
                 flag = False
+                cls = cls.replace('_or_', ',')
                 cls = cls.replace('/', ',')
                 cls = cls.replace('_', ' ')
+                cls = cls.lower()
                 for all_idx, all_cls in enumerate(thing_classes):
                     if set(cls.split(',')).intersection(set(all_cls.split(','))):
                         _thing_mapper[idy] = all_idx
@@ -79,8 +81,10 @@ class ConcatOVDataset(ConcatDataset, ABC):
 
             for idy, cls in enumerate(_stuff_classes):
                 flag = False
+                cls = cls.replace('_or_', ',')
                 cls = cls.replace('/', ',')
                 cls = cls.replace('_', ' ')
+                cls = cls.lower()
                 for all_idx, all_cls in enumerate(stuff_classes):
                     if set(cls.split(',')).intersection(set(all_cls.split(','))):
                         _stuff_mapper[idy] = all_idx
@@ -96,6 +100,7 @@ class ConcatOVDataset(ConcatDataset, ABC):
         dataset_idx = 0
         classes = [*thing_classes, *stuff_classes]
         mapper = []
+        meta_cls_names = []
         for _thing_mapper, _stuff_mapper in zip(thing_mapper, stuff_mapper):
             if not _thing_mapper and not _stuff_mapper:
                 # class agnostic dataset
@@ -111,6 +116,7 @@ class ConcatOVDataset(ConcatDataset, ABC):
                 assert len(_mapper) == len(_thing_mapper) + len(_stuff_mapper)
                 cnt += 1
                 cls_name = cls_name + cls_names[dataset_idx] + "_"
+                meta_cls_names.append(cls_names[dataset_idx])
             _mapper[NO_OBJ] = NO_OBJ
             mapper.append(_mapper)
             dataset_idx += 1
@@ -123,7 +129,8 @@ class ConcatOVDataset(ConcatDataset, ABC):
             'classes': classes,
             'thing_classes': thing_classes,
             'stuff_classes': stuff_classes,
-            'mapper': mapper
+            'mapper': mapper,
+            'dataset_names': meta_cls_names
         })
         print_log(
             f"------------{self.dataset_name}------------",

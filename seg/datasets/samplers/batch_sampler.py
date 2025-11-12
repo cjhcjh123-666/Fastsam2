@@ -57,7 +57,7 @@ class VideoSegAspectRatioBatchSampler(AspectRatioBatchSampler):
                 left_data = left_data[self.batch_size:]
 
 
-@DATA_SAMPLERS.register_module(force=True)
+@DATA_SAMPLERS.register_module()
 class MultiDataAspectRatioBatchSampler(BatchSampler):
     """A sampler wrapper for grouping images with similar aspect ratio (< 1 or.
 

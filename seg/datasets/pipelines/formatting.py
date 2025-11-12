@@ -198,10 +198,9 @@ class PackSAMInputs(PackDetInputs):
 
 @TRANSFORMS.register_module()
 class GeneratePoint(BaseTransform):
-    def __init__(self, num_proposals=60, num_mask_tokens=4, with_bbox=False):
+    def __init__(self, num_proposals=60, num_mask_tokens=4):
         self.num_proposals = num_proposals
         self.num_mask_tokens = num_mask_tokens
-        self.with_bbox = with_bbox
 
     def transform(self, results):
         data_samples = results['data_samples']
@@ -238,18 +237,10 @@ class GeneratePoint(BaseTransform):
                 'point_coords': selected_point,
                 'instances': selected_instances_idx,
             })
-        point_coords = torch.stack([itm['point_coords'] for itm in gt_collected]).float()
-        if self.with_bbox:
-            bboxes = gt_instances.bboxes[indices]
-            labels = gt_instances.labels[indices]
-            rand = torch.rand(len(bboxes))
-            bbox_select = ((labels < 80) & (rand < 0.5)).type(torch.bool)
-            point_coords[bbox_select] = bboxes[bbox_select].tensor.type_as(point_coords)
 
         data_samples.gt_instances_collected = InstanceData(
-            point_coords=point_coords,
+            point_coords=torch.stack([itm['point_coords'] for itm in gt_collected]),
             sub_instances=[itm['instances'] for itm in gt_collected],
-            idx=indices,
-            pb_labels=torch.ones_like(indices),
+            idx=indices
         )
         return results

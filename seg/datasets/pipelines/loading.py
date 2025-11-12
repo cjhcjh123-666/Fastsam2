@@ -15,34 +15,6 @@ from mmdet.datasets.transforms import LoadPanopticAnnotations
 from mmengine.fileio import get
 
 from seg.models.utils import NO_OBJ
-from mmdet.structures.bbox import get_box_type
-
-@TRANSFORMS.register_module()
-class LoadPanopticAnnotationsAll(LoadPanopticAnnotations):
-    def transform(self, results: dict) -> dict:
-        img_bytes = get(results['seg_map_path'], backend_args=self.backend_args)
-        pan_png = mmcv.imfrombytes(img_bytes, flag='color', channel_order='rgb').squeeze()
-        pan_png = self.rgb2id(pan_png)
-
-        gt_masks, gt_labels, gt_ignore_flags = [], [], []
-        gt_seg = np.zeros_like(pan_png) + NO_OBJ  # 255 as ignore
-        for segment_info in results['segments_info']:
-            mask = (pan_png == segment_info['id'])
-            gt_seg = np.where(mask, segment_info['category'], gt_seg)
-            gt_labels.append(segment_info['category'])
-            gt_masks.append(mask.astype(np.uint8))
-            if 'ignore_flag' not in segment_info:
-                segment_info['ignore_flag'] = 0
-            gt_ignore_flags.append(segment_info['ignore_flag'])
-        
-        h, w = results['ori_shape']
-        gt_masks = BitmapMasks(gt_masks, h, w)
-        results['gt_masks'] = gt_masks
-        results['gt_bboxes_labels'] = np.array(gt_labels)
-        results['gt_ignore_flags'] = np.array(gt_ignore_flags)
-        results['gt_bboxes'] = results['gt_masks'].get_bboxes(get_box_type(self.box_type)[1])
-        results['gt_seg_map'] = gt_seg
-        return results
 
 
 @TRANSFORMS.register_module()
