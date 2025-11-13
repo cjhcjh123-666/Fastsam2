@@ -11,7 +11,7 @@ from seg.datasets.pipelines.frame_sampling import VideoClipSample
 from seg.datasets.samplers.batch_sampler import VideoSegAspectRatioBatchSampler
 
 dataset_type = YouTubeVISDatasetV2
-data_root = 'data/youtube_vis_2021/'
+data_root = '/mnt/chenjiahui/Fastsam2-main/data/youtube_vis_2021/'
 dataset_version = data_root[-5:-1]  # 2019 or 2021
 
 backend_args = None

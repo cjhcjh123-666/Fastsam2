@@ -9,13 +9,14 @@ from mmengine.dataset import DefaultSampler
 from mmcv.transforms import LoadImageFromFile
 from mmdet.datasets.transforms import LoadAnnotations, RandomFlip, RandomCrop, PackDetInputs, Resize
 from seg.datasets.ref_seg import RefSegDataset
+from seg.datasets.pipelines.formatting import GeneratePoint
 
 data_root = 'data/ref_seg/'  # RefCOCO 数据集的根目录
 # 注意：RefCOCO 数据集使用 COCO 2014 图像，但如果您只有 COCO 2017 图像，
 # 代码会自动将文件名从 COCO_train2014_000000098304.jpg 转换为 000000098304.jpg
 # 因此可以使用 COCO 2017 的图像目录
 backend_args = None
-image_size = (1024, 1024)  # 与现有管线保持一致
+image_size = (1280, 736)  # 与现有管线保持一致
 
 train_pipeline_ref = [
     dict(type=LoadImageFromFile, to_float32=True, backend_args=backend_args),
@@ -33,7 +34,9 @@ train_pipeline_ref = [
         allow_negative_crop=True
     ),
     dict(type=PackDetInputs,
-         meta_keys=('img_id','img_path','ori_shape','img_shape','scale_factor'))
+         meta_keys=('img_id','img_path','ori_shape','img_shape','scale_factor','text')),
+    # generate point prompts from gt masks to align with current prompt pipeline
+    dict(type='GeneratePoint', num_proposals=30, num_mask_tokens=1)
 ]
 
 # 使用 REFER API 加载 RefCOCO 数据集
@@ -139,7 +142,7 @@ train_dataloader = dict(
     dataset=refcoco_dataset
 )
 
-# 如果需要合并多个数据集，可以使用 ConcatOVDataset:
+# #如果需要合并多个数据集，可以使用 ConcatOVDataset:
 # from seg.datasets.concat_dataset import ConcatOVDataset
 # train_dataloader = dict(
 #     batch_size=2,

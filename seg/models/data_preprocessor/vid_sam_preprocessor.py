@@ -24,6 +24,7 @@ except ImportError:
 
 from .vidseg_data_preprocessor import VideoSegDataPreprocessor
 from mmdet.models.data_preprocessors import TrackDataPreprocessor
+
 @MODELS.register_module()
 class VideoPromptDataPreprocessor(VideoSegDataPreprocessor):
     """Image pre-processor for tracking tasks.
@@ -129,9 +130,31 @@ class VideoPromptDataPreprocessor(VideoSegDataPreprocessor):
                     self.pad_gt_sem_seg(data_samples)
 
             if training and self.batch_augments is not None:
+                # 检查数据样本是否有 gt_sem_seg
+                has_gt_sem_seg = any('gt_sem_seg' in data_sample for data_sample in data_samples)
                 for batch_aug in self.batch_augments:
-                    inputs, data_samples = batch_aug(inputs, data_samples)
+                    # 如果 batch_aug 需要 gt_sem_seg 但数据样本没有，则临时禁用 pad_seg
+                    if hasattr(batch_aug, 'pad_seg') and batch_aug.pad_seg and not has_gt_sem_seg:
+                        original_pad_seg = batch_aug.pad_seg
+                        batch_aug.pad_seg = False
+                        try:
+                            inputs, data_samples = batch_aug(inputs, data_samples)
+                        finally:
+                            batch_aug.pad_seg = original_pad_seg
+                    else:
+                        inputs, data_samples = batch_aug(inputs, data_samples)
 
             return {'inputs': inputs, 'data_samples': data_samples}
         else:
             return super().forward(data, training)
+    
+    def pad_gt_sem_seg(self, data_samples: Sequence) -> None:
+        """Pad gt_sem_seg to shape of batch_input_shape.
+        
+        重写父类方法，添加检查以避免 AttributeError。
+        """
+        # 检查是否有数据样本包含 gt_sem_seg
+        if not data_samples or 'gt_sem_seg' not in data_samples[0]:
+            return
+        # 调用父类方法
+        super().pad_gt_sem_seg(data_samples)

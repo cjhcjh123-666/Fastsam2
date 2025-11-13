@@ -171,9 +171,31 @@ class VideoSegDataPreprocessor(DetDataPreprocessor):
                     self.pad_track_gt_sem_seg(data_samples)
 
         if training and self.batch_augments is not None:
+            # 检查数据样本是否有 gt_sem_seg
+            has_gt_sem_seg = False
+            if data_samples is not None and len(data_samples) > 0:
+                if isinstance(data_samples[0], TrackDataSample):
+                    # 对于 TrackDataSample，检查每个 track_data_sample 中的每个 det_sample
+                    has_gt_sem_seg = any(
+                        'gt_sem_seg' in det_sample 
+                        for track_data_sample in data_samples 
+                        for det_sample in track_data_sample
+                    )
+                else:
+                    has_gt_sem_seg = any('gt_sem_seg' in data_sample for data_sample in data_samples)
+            
             for batch_aug in self.batch_augments:
                 if self.use_det_processor and training or use_det:
-                    inputs, data_samples = batch_aug(inputs, data_samples)
+                    # 如果 batch_aug 需要 gt_sem_seg 但数据样本没有，则临时禁用 pad_seg
+                    if hasattr(batch_aug, 'pad_seg') and batch_aug.pad_seg and not has_gt_sem_seg:
+                        original_pad_seg = batch_aug.pad_seg
+                        batch_aug.pad_seg = False
+                        try:
+                            inputs, data_samples = batch_aug(inputs, data_samples)
+                        finally:
+                            batch_aug.pad_seg = original_pad_seg
+                    else:
+                        inputs, data_samples = batch_aug(inputs, data_samples)
                 else:
                     # For video segmentation, the batch augmentation are conducted
                     # on the batch dimension only, which means it will be run several

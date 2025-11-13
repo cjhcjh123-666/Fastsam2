@@ -10,7 +10,7 @@ from seg.datasets.pipelines.loading import LoadPanopticAnnotationsHB
 from seg.datasets.cityscapes import CityscapesPanopticDataset
 
 
-data_root = 'data/cityscapes/'
+data_root = '/mnt/chenjiahui/Fastsam2-main/data/cityscapes/'
 backend_args = None
 image_size = (1280, 736)
 

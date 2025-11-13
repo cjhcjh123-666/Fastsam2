@@ -60,6 +60,31 @@ class LoadPanopticAnnotationsHB(LoadPanopticAnnotations):
 
 
 @TRANSFORMS.register_module()
+class LoadPanopticAnnotationsAll(LoadPanopticAnnotationsHB):
+    """Load panoptic annotations with all options enabled by default.
+    
+    This class is a convenience wrapper around LoadPanopticAnnotationsHB
+    that enables bbox, mask, and seg by default.
+    """
+    
+    def __init__(
+        self,
+        with_bbox: bool = True,
+        with_mask: bool = True,
+        with_seg: bool = True,
+        backend_args: Optional[dict] = None,
+        **kwargs
+    ) -> None:
+        super().__init__(
+            with_bbox=with_bbox,
+            with_mask=with_mask,
+            with_seg=with_seg,
+            backend_args=backend_args,
+            **kwargs
+        )
+
+
+@TRANSFORMS.register_module()
 class LoadVideoSegAnnotations(LoadPanopticAnnotations):
 
     def __init__(

@@ -1,6 +1,5 @@
 from .mask2former_vid import Mask2formerVideo
 from .mask2former_vid_minvis import Mask2formerVideoMinVIS
-from .fastsam2 import Fastsam2
 # from .sam_clip_distill import BackboneDistillation
 # from .sam import SAM
 # from .sam_backbone_feats import SAMBF

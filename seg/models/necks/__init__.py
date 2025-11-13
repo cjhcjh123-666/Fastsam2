@@ -2,5 +2,4 @@
 # from .defrom_attn_neck import DeformAttnNeck
 from .sam_pe import SAMPromptEncoder
 # from .transformer_neck import SingleLayerTransformerNeck, MultiLayerTransformerNeck
-from .fastsam2_neck import Fastsam2Neck
-__all__ = ['SAMPromptEncoder','Fastsam2Neck']
+from .ramsam_neck import YOSONeck

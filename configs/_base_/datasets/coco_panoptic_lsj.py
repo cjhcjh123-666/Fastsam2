@@ -8,7 +8,7 @@ from mmdet.evaluation import CocoPanopticMetric, CocoMetric
 
 from seg.datasets.coco_ov import CocoPanopticOVDataset
 from seg.datasets.pipelines.loading import LoadPanopticAnnotationsHB
-
+from seg.datasets.pipelines.loading import FilterAnnotationsHB
 data_root = 'data/coco/'
 backend_args = None
 image_size = (1024, 1024)
@@ -38,6 +38,7 @@ train_pipeline = [
         crop_type='absolute',
         recompute_bbox=True,
         allow_negative_crop=True),
+    dict(type=FilterAnnotationsHB, by_box=False, by_mask=True,min_gt_mask_area=32),
     dict(type=PackDetInputs)
 ]
 train_dataloader = dict(
@@ -67,7 +68,7 @@ test_pipeline = [
     )
 ]
 val_dataloader = dict(
-    batch_size=2,
+    batch_size=1,
     num_workers=2,
     persistent_workers=True,
     drop_last=False,
@@ -91,11 +92,11 @@ val_evaluator = [
         seg_prefix=data_root + 'annotations/panoptic_val2017/',
         backend_args=backend_args
     ),
-    dict(
-        type=CocoMetric,
-        ann_file=data_root + 'annotations/instances_val2017.json',
-        metric=['segm'],
-        backend_args=backend_args
-    )
+    # dict(
+    #     type=CocoMetric,
+    #     ann_file=data_root + 'annotations/instances_val2017.json',
+    #     metric=['segm'],
+    #     backend_args=backend_args
+    # )
 ]
 test_evaluator = val_evaluator
