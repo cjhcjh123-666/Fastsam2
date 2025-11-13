@@ -679,47 +679,84 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                     has_boxes = i < len(batch_bboxes) and batch_bboxes[i] is not None
                     
                     if has_points or has_boxes:
-                        # Create InstanceData for this sample only
-                        inst = InstanceData()
-                        
                         # Set point_coords if available
                         if has_points:
                             point_coords = batch_point_coords[i]
-                            # Ensure point_coords has correct shape: [N, num_points, 2]
-                            # If it's 2D [num_points, 2], add batch dimension
+                            
+                            # Normalize point_coords shape to [N, num_points, 2]
+                            # point_coords can be:
+                            # - [num_points, 2]: single point per instance -> [1, num_points, 2]
+                            # - [num_points, 4]: two points per instance (x1,y1,x2,y2) -> reshape to [1, num_points*2, 2]
+                            # - [1, num_points, 2]: already correct format
+                            # - [1, num_points, 4]: two points per instance -> reshape to [1, num_points*2, 2]
+                            
                             if point_coords.dim() == 2:
-                                point_coords = point_coords.unsqueeze(0)  # [1, num_points, 2]
-                            # Create InstanceData with correct length
-                            inst = InstanceData(point_coords=point_coords)
+                                # [num_points, 2] or [num_points, 4]
+                                if point_coords.shape[1] == 4:
+                                    # Two points per instance: [num_points, 4] -> [num_points, 2, 2] -> [num_points*2, 2]
+                                    num_points = point_coords.shape[0]
+                                    point_coords = point_coords.view(num_points, 2, 2).view(-1, 2)  # [num_points*2, 2]
+                                # Add batch dimension: [num_points, 2] -> [1, num_points, 2]
+                                point_coords = point_coords.unsqueeze(0)  # [1, num_points, 2] or [1, num_points*2, 2]
+                            elif point_coords.dim() == 3:
+                                # [1, num_points, 2] or [1, num_points, 4]
+                                if point_coords.shape[2] == 4:
+                                    # Two points per instance: [1, num_points, 4] -> [1, num_points, 2, 2] -> [1, num_points*2, 2]
+                                    num_points = point_coords.shape[1]
+                                    point_coords = point_coords.view(1, num_points, 2, 2).view(1, -1, 2)  # [1, num_points*2, 2]
+                                # Already has batch dimension
+                            else:
+                                # Unexpected shape, skip points
+                                has_points = False
+                                point_coords = None
+                            
+                            if has_points:
+                                # Create InstanceData with correct point_coords
+                                point_inst = InstanceData(point_coords=point_coords)
+                                
+                                # Encode points
+                                if has_boxes:
+                                    # If both exist, encode separately
+                                    point_sparse, _ = self.prompt_encoder(
+                                        point_inst, image_size,
+                                        with_points=True,
+                                        with_bboxes=False,
+                                        with_masks=False
+                                    )
+                                    point_embeds_list.append(point_sparse)
+                                else:
+                                    # Only points
+                                    point_sparse, _ = self.prompt_encoder(
+                                        point_inst, image_size,
+                                        with_points=True,
+                                        with_bboxes=False,
+                                        with_masks=False
+                                    )
+                                    point_embeds_list.append(point_sparse)
                         
                         # Set bboxes if available
                         if has_boxes:
                             bboxes = batch_bboxes[i]
-                            # Ensure bboxes has correct shape: [N, 4]
-                            # If it's 1D [4], add batch dimension
+                            # Normalize bboxes shape to [N, 4]
                             if bboxes.dim() == 1:
-                                bboxes = bboxes.unsqueeze(0)  # [1, 4]
-                            elif bboxes.dim() == 2 and bboxes.shape[0] == 0:
-                                # Empty bboxes, skip
+                                # [4] -> [1, 4]
+                                bboxes = bboxes.unsqueeze(0)
+                            elif bboxes.dim() == 2:
+                                if bboxes.shape[0] == 0:
+                                    # Empty bboxes, skip
+                                    has_boxes = False
+                                elif bboxes.shape[1] != 4:
+                                    # Unexpected shape, skip
+                                    has_boxes = False
+                            else:
+                                # Unexpected shape, skip
                                 has_boxes = False
-                            if has_points:
-                                # If both exist, we need to handle them separately
-                                # For now, encode them separately and combine
-                                # First encode points
-                                # Ensure point_coords has correct shape
-                                if point_coords.dim() == 2:
-                                    point_coords = point_coords.unsqueeze(0)  # [1, num_points, 2]
-                                point_inst = InstanceData(point_coords=point_coords)
-                                point_sparse, _ = self.prompt_encoder(
-                                    point_inst, image_size,
-                                    with_points=True,
-                                    with_bboxes=False,
-                                    with_masks=False
-                                )
-                                point_embeds_list.append(point_sparse)
-                                
-                                # Then encode boxes
+                            
+                            if has_boxes:
+                                # Create InstanceData with correct bboxes
                                 box_inst = InstanceData(bboxes=bboxes)
+                                
+                                # Encode boxes
                                 box_sparse, _ = self.prompt_encoder(
                                     box_inst, image_size,
                                     with_points=False,
@@ -727,25 +764,6 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                                     with_masks=False
                                 )
                                 box_embeds_list.append(box_sparse)
-                            else:
-                                # Only boxes
-                                inst = InstanceData(bboxes=bboxes)
-                                sparse_embeds, _ = self.prompt_encoder(
-                                    inst, image_size,
-                                    with_points=False,
-                                    with_bboxes=True,
-                                    with_masks=False
-                                )
-                                box_embeds_list.append(sparse_embeds)
-                        elif has_points:
-                            # Only points
-                            sparse_embeds, _ = self.prompt_encoder(
-                                inst, image_size,
-                                with_points=True,
-                                with_bboxes=False,
-                                with_masks=False
-                            )
-                            point_embeds_list.append(sparse_embeds)
                 
                 # Stack embeddings if available
                 if point_embeds_list:
