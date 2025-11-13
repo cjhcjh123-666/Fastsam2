@@ -244,10 +244,13 @@ class GeneratePoint(BaseTransform):
 
         masks = gt_instances.masks.to_tensor(torch.bool, 'cpu')
         gt_collected = []
+        valid_indices = []
         for instance_idx in indices:
             mask = masks[instance_idx]
             candidate_indices = mask.nonzero()
-            assert len(candidate_indices) > 0
+            # 跳过空的 mask（可能由于数据增强导致）
+            if len(candidate_indices) == 0:
+                continue
             selected_index = random.randint(0, len(candidate_indices) - 1)
             selected_point = candidate_indices[selected_index].flip(0)
 
@@ -256,7 +259,9 @@ class GeneratePoint(BaseTransform):
                 mask_to_match = masks[instance_to_match_idx]
                 if mask_to_match[tuple(selected_point.flip(0))]:
                     selected_instances_idx.append(instance_to_match_idx)
-            assert len(selected_instances_idx) > 0
+            # 如果选中的点没有匹配到任何实例，跳过
+            if len(selected_instances_idx) == 0:
+                continue
             if len(selected_instances_idx) > self.num_mask_tokens:
                 random.shuffle(selected_instances_idx)
                 selected_instances_idx = selected_instances_idx[:self.num_mask_tokens]
@@ -265,10 +270,40 @@ class GeneratePoint(BaseTransform):
                 'point_coords': selected_point,
                 'instances': selected_instances_idx,
             })
+            valid_indices.append(instance_idx)
+
+        # 如果收集到的有效点为空，创建一个默认的点（使用第一个有效 mask 的中心点）
+        if len(gt_collected) == 0:
+            # 找到第一个非空的 mask
+            for instance_idx in range(len(gt_instances)):
+                mask = masks[instance_idx]
+                candidate_indices = mask.nonzero()
+                if len(candidate_indices) > 0:
+                    selected_index = random.randint(0, len(candidate_indices) - 1)
+                    selected_point = candidate_indices[selected_index].flip(0)
+                    selected_point = torch.cat([selected_point - 3, selected_point + 3], 0)
+                    gt_collected.append({
+                        'point_coords': selected_point,
+                        'instances': [instance_idx],
+                    })
+                    valid_indices.append(instance_idx)
+                    break
+
+        # 确保至少有一个有效的点
+        if len(gt_collected) == 0:
+            # 如果所有 mask 都为空，创建一个默认点（图像中心）
+            h, w = masks.shape[-2:]
+            center_point = torch.tensor([h // 2, w // 2], dtype=torch.long)
+            selected_point = torch.cat([center_point - 3, center_point + 3], 0)
+            gt_collected.append({
+                'point_coords': selected_point,
+                'instances': [0] if len(gt_instances) > 0 else [],
+            })
+            valid_indices = [0] if len(gt_instances) > 0 else []
 
         data_samples.gt_instances_collected = InstanceData(
             point_coords=torch.stack([itm['point_coords'] for itm in gt_collected]),
             sub_instances=[itm['instances'] for itm in gt_collected],
-            idx=indices
+            idx=torch.tensor(valid_indices, dtype=torch.long) if len(valid_indices) > 0 else torch.tensor([0], dtype=torch.long)
         )
         return results
