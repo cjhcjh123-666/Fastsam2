@@ -77,17 +77,28 @@ class StreamingMemoryAdapter(nn.Module):
         Args:
             frame_id: Current frame ID.
             instance_embed: Instance embedding tensor [N, C].
-            mask: Instance mask tensor [N, H, W].
+            mask: Instance mask tensor [N, H, W] or BitmapMasks object.
             instance_id: Optional instance ID for tracking.
             text_embed: Optional text embedding for language-guided memory.
         """
+        # Convert mask to tensor if it's BitmapMasks
+        from mmdet.structures.mask import BitmapMasks
+        if isinstance(mask, BitmapMasks):
+            # Convert BitmapMasks to tensor
+            mask_tensor = mask.to_tensor(dtype=torch.float32, device=instance_embed.device)
+        elif isinstance(mask, torch.Tensor):
+            mask_tensor = mask.detach() if mask.requires_grad else mask
+        else:
+            # Try to convert to tensor
+            mask_tensor = torch.tensor(mask, dtype=torch.float32, device=instance_embed.device)
+        
         # Update short-term memory (FIFO)
         mem_entry = {
             'frame_id': frame_id,
-            'embed': instance_embed.detach(),
-            'mask': mask.detach(),
+            'embed': instance_embed.detach() if instance_embed.requires_grad else instance_embed,
+            'mask': mask_tensor,
             'instance_id': instance_id,
-            'text_embed': text_embed.detach() if text_embed is not None else None
+            'text_embed': text_embed.detach() if text_embed is not None and text_embed.requires_grad else text_embed
         }
         
         self.short_mem.append(mem_entry)

@@ -290,10 +290,25 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                                     # Update memory with current frame
                                     if masks is not None and instance_ids is not None:
                                         # Extract per-instance embeddings
+                                        from mmdet.structures.mask import BitmapMasks
+                                        
                                         for inst_idx, inst_id in enumerate(instance_ids):
                                             if inst_idx < frame_kernels.shape[1]:
                                                 inst_embed = frame_kernels[0, inst_idx:inst_idx+1, :]  # [1, C]
-                                                inst_mask = masks[inst_idx:inst_idx+1]  # [1, H, W]
+                                                
+                                                # Extract mask and convert to tensor if needed
+                                                if isinstance(masks, BitmapMasks):
+                                                    # BitmapMasks: extract single mask and convert to tensor
+                                                    inst_mask = masks[inst_idx:inst_idx+1].to_tensor(
+                                                        dtype=torch.float32, 
+                                                        device=inst_embed.device
+                                                    )  # [1, H, W]
+                                                elif isinstance(masks, torch.Tensor):
+                                                    # Already a tensor
+                                                    inst_mask = masks[inst_idx:inst_idx+1]  # [1, H, W]
+                                                else:
+                                                    # Try to get mask directly
+                                                    inst_mask = masks[inst_idx:inst_idx+1]
                                                 
                                                 # Update memory
                                                 self.streaming_memory.update(
