@@ -5,3 +5,6 @@ from .class_overlapping import calculate_class_overlapping
 from .online_pq_utils import cal_pq, IoUObj, NO_OBJ_ID
 from .no_obj import NO_OBJ
 from .offline_video_metrics import vpq_eval, stq
+from .task_router import TaskRouter, TaskType, PromptType
+from .memory_adapter import StreamingMemoryAdapter
+from .prompt_fusion import PromptFusion

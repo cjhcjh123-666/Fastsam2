@@ -43,9 +43,43 @@ data_preprocessor = dict(
 num_things_classes = 145
 num_stuff_classes = 102
 num_classes = num_things_classes + num_stuff_classes
+
+# Multi-task components configuration
+task_router = dict(
+    type='TaskRouter',
+    feat_channels=256,
+    num_decoder_stages=3,
+    enable_streaming_memory=True,
+    interactive_stages=3,
+    vos_stages=3,
+    panoptic_stages=3
+)
+
+streaming_memory = dict(
+    type='StreamingMemoryAdapter',
+    feat_channels=256,
+    long_mem_size=10,
+    short_mem_size=5,
+    update_strategy='adaptive'
+)
+
+prompt_fusion = dict(
+    type='PromptFusion',
+    feat_channels=256,
+    num_heads=8,
+    dropout=0.1
+)
+
 model = dict(
     type=RapSAM,
     data_preprocessor=data_preprocessor,
+    # Multi-task configuration
+    use_task_router=True,
+    task_router=task_router,
+    use_streaming_memory=True,
+    streaming_memory=streaming_memory,
+    use_prompt_fusion=True,
+    prompt_fusion=prompt_fusion,
     backbone=dict(
         type=ResNet,
         depth=50,
