@@ -71,14 +71,14 @@ prompt_fusion = dict(
     use_text_encoder=True,
     text_encoder=dict(
         type='TextEncoder',
-        feat_channels=256
+        feat_channels=256,
         # text_model_cfg can be added here for CLIP text encoder
         # Example:
-        # text_model_cfg=dict(
-        #     type='OpenCLIPBackboneText',
-        #     model_name='ViT-B-16',
-        #     init_cfg=dict(type='clip_pretrain', checkpoint='...')
-        # )
+        text_model_cfg=dict(
+            type='OpenCLIPBackboneText',
+            model_name='ViT-L-14',
+            init_cfg=dict(type='clip_pretrain', checkpoint='/mnt/chenjiahui/Fastsam2-main/checkpoints/openclip_vitl14_pretrain.pt')
+        )
     )
 )
 
