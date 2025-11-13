@@ -40,8 +40,8 @@ data_preprocessor = dict(
     batch_augments=batch_augments
 )
 
-num_things_classes = 102
-num_stuff_classes = 53
+num_things_classes = 145
+num_stuff_classes = 102
 num_classes = num_things_classes + num_stuff_classes
 model = dict(
     type=RapSAM,

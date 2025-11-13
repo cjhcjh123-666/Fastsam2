@@ -1051,7 +1051,17 @@ class Mask2FormerVideoHead(AnchorFreeHead):
         gt_instances = [t.gt_instances_collected for t in batch_data_samples]
 
         point_coords = torch.stack([inst.point_coords for inst in gt_instances])
-        pb_labels = torch.stack([inst['pb_labels'] for inst in gt_instances])
+        # 检查并创建 pb_labels，如果不存在则使用默认值（全1）
+        pb_labels_list = []
+        for inst in gt_instances:
+            if hasattr(inst, 'pb_labels'):
+                pb_labels_list.append(inst.pb_labels)
+            else:
+                # 如果没有 pb_labels，创建默认值（全1，表示正样本）
+                device = inst.point_coords.device
+                pb_labels = torch.ones(len(inst.point_coords), dtype=torch.long, device=device)
+                pb_labels_list.append(pb_labels)
+        pb_labels = torch.stack(pb_labels_list)
         labels = torch.zeros_like(pb_labels).long()
 
         boxes = point_coords  # + boxes
