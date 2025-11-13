@@ -85,6 +85,8 @@ refcoco_dataset = dict(
             recompute_bbox=True,
             allow_negative_crop=True
         ),
+        # 过滤掉裁剪后无效的实例（mask 面积太小或为空）
+        dict(type=FilterAnnotationsHB, by_box=False, by_mask=True, min_gt_mask_area=32),
         dict(type=PackDetInputs,
              meta_keys=('img_id','img_path','ori_shape','img_shape','scale_factor','text')),
         # generate point prompts from gt masks to align with current prompt pipeline
