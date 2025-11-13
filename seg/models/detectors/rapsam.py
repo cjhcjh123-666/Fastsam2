@@ -146,7 +146,10 @@ class RapSAM(Mask2formerVideo):
         
         # Add task-specific losses (e.g., DPSR for VOS)
         if routing_config and routing_config.get('task_specific_config', {}).get('enable_dpsr'):
-            dpsr_loss = self._compute_dpsr_loss(batch_data_samples)
+            # Try to get predictions from head for DPSR loss
+            # In practice, we might need to store predictions during forward pass
+            prev_predictions = getattr(self, '_prev_predictions', None)
+            dpsr_loss = self._compute_dpsr_loss(batch_data_samples, prev_predictions)
             if dpsr_loss is not None:
                 losses['loss_dpsr'] = dpsr_loss
         
@@ -210,7 +213,8 @@ class RapSAM(Mask2formerVideo):
         
         return prompts if prompts else None
     
-    def _compute_dpsr_loss(self, batch_data_samples: SampleList) -> Optional[torch.Tensor]:
+    def _compute_dpsr_loss(self, batch_data_samples: SampleList, 
+                          prev_predictions: Optional[Dict] = None) -> Optional[torch.Tensor]:
         """Compute Dual-Path Self-Refinement (DPSR) loss for VOS.
         
         DPSR loss enforces temporal consistency between consecutive frames:
@@ -219,29 +223,42 @@ class RapSAM(Mask2formerVideo):
         
         Args:
             batch_data_samples: List of data samples (TrackDataSample for video).
+            prev_predictions: Optional dict containing previous frame predictions.
+                If None, uses ground truth for training.
+                Format: {
+                    'masks': List of previous frame masks,
+                    'embeddings': List of previous frame embeddings,
+                    'instance_ids': List of instance IDs
+                }
             
         Returns:
             DPSR loss tensor or None if not applicable.
         """
         from mmdet.structures import TrackDataSample
-        from mmcv.ops import dice_loss
+        import torch.nn.functional as F
         
         # Only compute for video data (TrackDataSample)
         if not batch_data_samples or not isinstance(batch_data_samples[0], TrackDataSample):
             return None
         
-        # Get predictions from head (this would be stored during forward pass)
-        # For now, we'll compute based on ground truth for training
-        total_loss = 0.0
+        total_mask_loss = 0.0
+        total_feat_loss = 0.0
         num_frames_with_loss = 0
         
-        for track_sample in batch_data_samples:
+        for batch_idx, track_sample in enumerate(batch_data_samples):
             if not hasattr(track_sample, 'video_data_samples'):
                 continue
             
             video_samples = track_sample.video_data_samples
             if len(video_samples) < 2:
                 continue  # Need at least 2 frames
+            
+            # Get previous predictions if available
+            prev_masks_pred = None
+            prev_embeds_pred = None
+            if prev_predictions is not None:
+                prev_masks_pred = prev_predictions.get('masks', {}).get(batch_idx, None)
+                prev_embeds_pred = prev_predictions.get('embeddings', {}).get(batch_idx, None)
             
             # Process consecutive frame pairs
             for frame_idx in range(1, len(video_samples)):
@@ -266,11 +283,21 @@ class RapSAM(Mask2formerVideo):
                 if not common_ids:
                     continue
                 
-                # Get masks for matched instances
-                if hasattr(prev_instances, 'masks') and hasattr(curr_instances, 'masks'):
+                # Compute mask consistency loss
+                # Use predictions if available, otherwise use ground truth
+                prev_masks = None
+                curr_masks = None
+                
+                if prev_masks_pred is not None and frame_idx - 1 < len(prev_masks_pred):
+                    # Use predicted masks from previous frame
+                    prev_masks = prev_masks_pred[frame_idx - 1]
+                elif hasattr(prev_instances, 'masks'):
                     prev_masks = prev_instances.masks
+                
+                if hasattr(curr_instances, 'masks'):
                     curr_masks = curr_instances.masks
-                    
+                
+                if prev_masks is not None and curr_masks is not None:
                     # Compute mask consistency loss (Dice loss)
                     for inst_id in common_ids:
                         prev_idx = (prev_ids == inst_id).nonzero(as_tuple=True)[0]
@@ -280,16 +307,40 @@ class RapSAM(Mask2formerVideo):
                             prev_mask = prev_masks[prev_idx[0]].float()
                             curr_mask = curr_masks[curr_idx[0]].float()
                             
+                            # Ensure same spatial size
+                            if prev_mask.shape != curr_mask.shape:
+                                prev_mask = F.interpolate(
+                                    prev_mask.unsqueeze(0).unsqueeze(0),
+                                    size=curr_mask.shape[-2:],
+                                    mode='bilinear',
+                                    align_corners=False
+                                ).squeeze(0).squeeze(0)
+                            
                             # Dice loss
                             intersection = (prev_mask * curr_mask).sum()
                             union = prev_mask.sum() + curr_mask.sum()
                             dice = 2.0 * intersection / (union + 1e-7)
                             mask_loss = 1.0 - dice
                             
-                            total_loss += mask_loss
+                            total_mask_loss += mask_loss
+                            
+                            # Feature consistency loss (if embeddings available)
+                            if prev_embeds_pred is not None and frame_idx - 1 < len(prev_embeds_pred):
+                                prev_embed = prev_embeds_pred[frame_idx - 1]
+                                if prev_idx[0] < prev_embed.shape[0]:
+                                    # Get current frame embeddings (would need to be passed in)
+                                    # For now, we compute based on mask similarity
+                                    # In practice, this would use actual instance embeddings
+                                    feat_loss = 0.0  # Placeholder
+                                    total_feat_loss += feat_loss
+                            
                             num_frames_with_loss += 1
         
         if num_frames_with_loss > 0:
-            return total_loss / num_frames_with_loss
+            # Combine mask and feature losses
+            mask_loss = total_mask_loss / num_frames_with_loss
+            feat_loss = total_feat_loss / num_frames_with_loss if total_feat_loss > 0 else 0.0
+            total_loss = mask_loss + 0.1 * feat_loss  # Weight feature loss less
+            return total_loss
         
         return None
