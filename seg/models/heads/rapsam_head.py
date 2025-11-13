@@ -685,16 +685,30 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                         # Set point_coords if available
                         if has_points:
                             point_coords = batch_point_coords[i]
+                            # Ensure point_coords has correct shape: [N, num_points, 2]
+                            # If it's 2D [num_points, 2], add batch dimension
+                            if point_coords.dim() == 2:
+                                point_coords = point_coords.unsqueeze(0)  # [1, num_points, 2]
                             # Create InstanceData with correct length
                             inst = InstanceData(point_coords=point_coords)
                         
                         # Set bboxes if available
                         if has_boxes:
                             bboxes = batch_bboxes[i]
+                            # Ensure bboxes has correct shape: [N, 4]
+                            # If it's 1D [4], add batch dimension
+                            if bboxes.dim() == 1:
+                                bboxes = bboxes.unsqueeze(0)  # [1, 4]
+                            elif bboxes.dim() == 2 and bboxes.shape[0] == 0:
+                                # Empty bboxes, skip
+                                has_boxes = False
                             if has_points:
                                 # If both exist, we need to handle them separately
                                 # For now, encode them separately and combine
                                 # First encode points
+                                # Ensure point_coords has correct shape
+                                if point_coords.dim() == 2:
+                                    point_coords = point_coords.unsqueeze(0)  # [1, num_points, 2]
                                 point_inst = InstanceData(point_coords=point_coords)
                                 point_sparse, _ = self.prompt_encoder(
                                     point_inst, image_size,
