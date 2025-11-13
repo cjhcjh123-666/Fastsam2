@@ -766,10 +766,51 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                                 box_embeds_list.append(box_sparse)
                 
                 # Stack embeddings if available
+                # Ensure all samples have embeddings (even if empty) to maintain batch consistency
+                batch_size = len(batch_data_samples)
                 if point_embeds_list:
-                    point_embed = torch.cat(point_embeds_list, dim=0)
+                    # Check if we have embeddings for all samples
+                    if len(point_embeds_list) == batch_size:
+                        point_embed = torch.cat(point_embeds_list, dim=0)  # [B, N, C]
+                    else:
+                        # Some samples don't have point embeddings, create empty ones
+                        # Get feature dimension from first embedding
+                        feat_dim = point_embeds_list[0].shape[-1]
+                        full_point_embeds = []
+                        embed_idx = 0
+                        for i in range(batch_size):
+                            if i < len(batch_point_coords) and batch_point_coords[i] is not None:
+                                full_point_embeds.append(point_embeds_list[embed_idx])
+                                embed_idx += 1
+                            else:
+                                # Create empty embedding [1, 0, C]
+                                full_point_embeds.append(torch.empty((1, 0, feat_dim), 
+                                                                    device=point_embeds_list[0].device))
+                        point_embed = torch.cat(full_point_embeds, dim=0)  # [B, N, C]
+                else:
+                    point_embed = None
+                
                 if box_embeds_list:
-                    box_embed = torch.cat(box_embeds_list, dim=0)
+                    # Check if we have embeddings for all samples
+                    if len(box_embeds_list) == batch_size:
+                        box_embed = torch.cat(box_embeds_list, dim=0)  # [B, N, C]
+                    else:
+                        # Some samples don't have box embeddings, create empty ones
+                        # Get feature dimension from first embedding
+                        feat_dim = box_embeds_list[0].shape[-1]
+                        full_box_embeds = []
+                        embed_idx = 0
+                        for i in range(batch_size):
+                            if i < len(batch_bboxes) and batch_bboxes[i] is not None:
+                                full_box_embeds.append(box_embeds_list[embed_idx])
+                                embed_idx += 1
+                            else:
+                                # Create empty embedding [1, 0, C]
+                                full_box_embeds.append(torch.empty((1, 0, feat_dim), 
+                                                                  device=box_embeds_list[0].device))
+                        box_embed = torch.cat(full_box_embeds, dim=0)  # [B, N, C]
+                else:
+                    box_embed = None
         
         # Process text prompts (if text encoder is available in PromptFusion)
         if batch_texts and self.prompt_fusion_module is not None:

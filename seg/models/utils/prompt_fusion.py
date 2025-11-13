@@ -178,16 +178,60 @@ class PromptFusion(nn.Module):
         
         # Collect available prompts
         prompts = []
+        batch_size = None
+        
         if point_embed is not None:
             prompts.append(point_embed)
+            batch_size = point_embed.shape[0]
         if box_embed is not None:
             prompts.append(box_embed)
+            if batch_size is None:
+                batch_size = box_embed.shape[0]
+            elif batch_size != box_embed.shape[0]:
+                # Batch size mismatch, pad or trim to match
+                if batch_size < box_embed.shape[0]:
+                    # Trim box_embed
+                    box_embed = box_embed[:batch_size]
+                else:
+                    # Pad box_embed with empty embeddings
+                    feat_dim = box_embed.shape[-1]
+                    pad_size = batch_size - box_embed.shape[0]
+                    empty_box = torch.empty((pad_size, 0, feat_dim), device=box_embed.device)
+                    box_embed = torch.cat([box_embed, empty_box], dim=0)
+                prompts[-1] = box_embed  # Update the last added prompt
         if text_embed is not None:
             prompts.append(text_embed)
+            if batch_size is None:
+                batch_size = text_embed.shape[0]
+            elif batch_size != text_embed.shape[0]:
+                # Batch size mismatch, pad or trim to match
+                if batch_size < text_embed.shape[0]:
+                    # Trim text_embed
+                    text_embed = text_embed[:batch_size]
+                else:
+                    # Pad text_embed with empty embeddings
+                    feat_dim = text_embed.shape[-1]
+                    pad_size = batch_size - text_embed.shape[0]
+                    empty_text = torch.empty((pad_size, 0, feat_dim), device=text_embed.device)
+                    text_embed = torch.cat([text_embed, empty_text], dim=0)
+                prompts[-1] = text_embed  # Update the last added prompt
         
         if not prompts:
             # Return None if no prompts
             return None
+        
+        # Ensure all prompts have the same batch size
+        if batch_size is not None:
+            for i, prompt in enumerate(prompts):
+                if prompt.shape[0] != batch_size:
+                    # Pad or trim to match batch_size
+                    if prompt.shape[0] < batch_size:
+                        feat_dim = prompt.shape[-1]
+                        pad_size = batch_size - prompt.shape[0]
+                        empty_prompt = torch.empty((pad_size, 0, feat_dim), device=prompt.device)
+                        prompts[i] = torch.cat([prompt, empty_prompt], dim=0)
+                    else:
+                        prompts[i] = prompt[:batch_size]
         
         # Concatenate all prompts
         concat_prompts = torch.cat(prompts, dim=1)  # [B, N_total, C]
