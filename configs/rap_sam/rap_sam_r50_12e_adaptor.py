@@ -67,7 +67,30 @@ prompt_fusion = dict(
     type='PromptFusion',
     feat_channels=256,
     num_heads=8,
-    dropout=0.1
+    dropout=0.1,
+    use_text_encoder=True,
+    text_encoder=dict(
+        type='TextEncoder',
+        feat_channels=256
+        # text_model_cfg can be added here for CLIP text encoder
+        # Example:
+        # text_model_cfg=dict(
+        #     type='OpenCLIPBackboneText',
+        #     model_name='ViT-B-16',
+        #     init_cfg=dict(type='clip_pretrain', checkpoint='...')
+        # )
+    )
+)
+
+# SAMPromptEncoder for encoding point/box prompts
+prompt_encoder = dict(
+    type='SAMPromptEncoder',
+    model_name='vit_h',
+    fix=True,
+    init_cfg=dict(
+        type='sam_pretrain',
+        checkpoint='sam_vit_h'
+    )
 )
 
 model = dict(
@@ -102,6 +125,7 @@ model = dict(
         panoptic_with_kernel_updator=True,
         use_adaptor=True,
         use_kernel_updator=True,
+        prompt_encoder=prompt_encoder,
         sphere_cls=True,
         ov_classifier_name='convnext_large_d_320_Concat_CocoPanopticOVDataset_YouTubeVISDataset_2019_YouTubeVISDataset_2021_VIPSegDataset_CityscapesPanopticDataset',
         num_stages=3,

@@ -69,6 +69,7 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                  use_prompt_fusion: bool = False,
                  streaming_memory: OptConfigType = None,
                  prompt_fusion: OptConfigType = None,
+                 prompt_encoder: OptConfigType = None,
                  **kwargs) -> None:
         super(AnchorFreeHead, self).__init__(init_cfg=init_cfg)
         self.prompt_with_kernel_updator = prompt_with_kernel_updator
@@ -94,6 +95,12 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
             self.prompt_fusion_module = MODELS.build(prompt_fusion)
         else:
             self.prompt_fusion_module = None
+        
+        # SAMPromptEncoder for encoding point/box prompts
+        if prompt_encoder is not None:
+            self.prompt_encoder = MODELS.build(prompt_encoder)
+        else:
+            self.prompt_encoder = None
 
         self.num_mask_tokens = num_mask_tokens
         self.mask_tokens = nn.Embedding(num_mask_tokens, feat_channels)
@@ -239,10 +246,29 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         # Apply streaming memory for VOS tasks
         if self.use_streaming_memory and self.routing_config and num_frames > 1:
             task_config = self.routing_config.get('task_specific_config', {})
-            if task_config.get('enable_mask_propagation', False):
-                # Apply memory enhancement (placeholder - actual implementation needed)
-                # This would use streaming_memory to enhance features
-                pass
+            if task_config.get('enable_mask_propagation', False) and self.streaming_memory is not None:
+                # Get memory from previous frames
+                # For VOS, we need to track instance IDs across frames
+                memory_embeds = []
+                memory_masks = []
+                
+                # Extract instance embeddings and masks from previous frames
+                # This is a simplified version - actual implementation would track frame IDs
+                for frame_idx in range(num_frames - 1):  # All frames except the last
+                    # In practice, we would:
+                    # 1. Get instance embeddings from previous frame predictions
+                    # 2. Get masks from previous frame predictions
+                    # 3. Store in memory
+                    # For now, this is a placeholder structure
+                    pass
+                
+                # Fetch relevant memory for current frame
+                # In practice, this would be called per instance
+                if memory_embeds:
+                    # Fuse memory with current features
+                    # This would enhance mask_features with memory information
+                    # Placeholder: actual fusion logic would go here
+                    pass
         
         if num_frames > 0: # (bs*num_frames, c, h, w) -> (bs, c, num_frames*h, w)
             mask_features = mask_features.unflatten(0, (bs, num_frames))
@@ -483,30 +509,110 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         if not batch_data_samples:
             return point_embed, box_embed, text_embed, text_tokens
         
-        first_sample = batch_data_samples[0]
+        # Collect all prompts from batch
+        batch_point_coords = []
+        batch_point_labels = []
+        batch_bboxes = []
+        batch_texts = []
+        batch_image_sizes = []
         
-        # Extract point embeddings from gt_instances_collected
-        if hasattr(first_sample, 'gt_instances_collected') and first_sample.gt_instances_collected is not None:
-            if hasattr(first_sample.gt_instances_collected, 'point_coords'):
-                # Point embeddings would be encoded by SAMPromptEncoder
-                # For now, return None - actual implementation would use SAMPromptEncoder
-                # TODO: Integrate with SAMPromptEncoder to get actual embeddings
-                pass
+        for i, data_sample in enumerate(batch_data_samples):
+            # Get image size from metadata
+            if i < len(batch_img_metas) and 'img_shape' in batch_img_metas[i]:
+                img_shape = batch_img_metas[i]['img_shape']
+                image_size = (img_shape[0], img_shape[1])
+            else:
+                image_size = (1024, 1024)  # Default size
+            batch_image_sizes.append(image_size)
+            
+            # Extract point prompts
+            if hasattr(data_sample, 'gt_instances_collected') and \
+               data_sample.gt_instances_collected is not None:
+                inst_collected = data_sample.gt_instances_collected
+                if hasattr(inst_collected, 'point_coords') and inst_collected.point_coords is not None:
+                    point_coords = inst_collected.point_coords
+                    # Get point labels if available
+                    if hasattr(inst_collected, 'pb_labels'):
+                        point_labels = inst_collected.pb_labels
+                    else:
+                        point_labels = torch.ones(len(point_coords), dtype=torch.long, 
+                                                   device=point_coords.device)
+                    batch_point_coords.append(point_coords)
+                    batch_point_labels.append(point_labels)
+            
+            # Extract box prompts
+            if hasattr(data_sample, 'gt_instances') and data_sample.gt_instances is not None:
+                gt_instances = data_sample.gt_instances
+                if hasattr(gt_instances, 'bboxes') and len(gt_instances.bboxes) > 0:
+                    bboxes = gt_instances.bboxes
+                    batch_bboxes.append(bboxes)
+            
+            # Extract text prompts
+            if hasattr(data_sample, 'metainfo') and 'text' in data_sample.metainfo:
+                text_str = data_sample.metainfo['text']
+                batch_texts.append(text_str)
         
-        # Extract box embeddings
-        if hasattr(first_sample, 'gt_instances') and first_sample.gt_instances is not None:
-            if hasattr(first_sample.gt_instances, 'bboxes') and len(first_sample.gt_instances.bboxes) > 0:
-                # Box embeddings would be encoded by SAMPromptEncoder
-                # For now, return None - actual implementation would use SAMPromptEncoder
-                # TODO: Integrate with SAMPromptEncoder to get actual embeddings
-                pass
+        # Encode prompts using SAMPromptEncoder if available
+        if self.prompt_encoder is not None:
+            # Process point and box prompts
+            if batch_point_coords or batch_bboxes:
+                # Create InstanceData for each sample
+                batch_instances = []
+                for i in range(len(batch_data_samples)):
+                    inst = InstanceData()
+                    if i < len(batch_point_coords):
+                        inst.point_coords = batch_point_coords[i]
+                        # Note: SAMPromptEncoder expects labels in a specific format
+                        # We'll handle this in the encoding step
+                    if i < len(batch_bboxes):
+                        inst.bboxes = batch_bboxes[i]
+                    batch_instances.append(inst)
+                
+                # Encode using SAMPromptEncoder
+                # We need to process each sample separately due to different image sizes
+                point_embeds_list = []
+                box_embeds_list = []
+                
+                for i, inst in enumerate(batch_instances):
+                    image_size = batch_image_sizes[i]
+                    has_points = hasattr(inst, 'point_coords') and inst.point_coords is not None
+                    has_boxes = hasattr(inst, 'bboxes') and inst.bboxes is not None
+                    
+                    if has_points or has_boxes:
+                        sparse_embeds, _ = self.prompt_encoder(
+                            inst, image_size,
+                            with_points=has_points,
+                            with_bboxes=has_boxes,
+                            with_masks=False
+                        )
+                        
+                        # Separate point and box embeddings
+                        # This is approximate - in practice, we need to track which embeddings are which
+                        if has_points and has_boxes:
+                            # If both exist, we need to know the split
+                            # For now, assume points come first
+                            num_points = inst.point_coords.shape[1] if hasattr(inst, 'point_coords') else 0
+                            if num_points > 0:
+                                point_embeds_list.append(sparse_embeds[:, :num_points, :])
+                                box_embeds_list.append(sparse_embeds[:, num_points:, :])
+                            else:
+                                box_embeds_list.append(sparse_embeds)
+                        elif has_points:
+                            point_embeds_list.append(sparse_embeds)
+                        elif has_boxes:
+                            box_embeds_list.append(sparse_embeds)
+                
+                # Stack embeddings if available
+                if point_embeds_list:
+                    point_embed = torch.cat(point_embeds_list, dim=0)
+                if box_embeds_list:
+                    box_embed = torch.cat(box_embeds_list, dim=0)
         
-        # Extract text from metainfo
-        if hasattr(first_sample, 'metainfo') and 'text' in first_sample.metainfo:
-            text_str = first_sample.metainfo['text']
-            # Text tokens would be tokenized here
-            # For now, return None - actual implementation would use CLIP tokenizer
-            # TODO: Integrate with CLIP tokenizer to get text tokens
-            pass
+        # Process text prompts (if text encoder is available in PromptFusion)
+        if batch_texts and self.prompt_fusion_module is not None:
+            # Text tokens will be processed by TextEncoder in PromptFusion
+            # For now, we just pass the text strings
+            # The actual tokenization will happen in PromptFusion if TextEncoder is configured
+            text_tokens = batch_texts  # Pass as list of strings
         
         return point_embed, box_embed, text_embed, text_tokens

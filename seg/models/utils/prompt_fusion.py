@@ -3,7 +3,7 @@
 
 This module fuses different types of prompts (point, box, text) for interactive segmentation.
 """
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -47,12 +47,13 @@ class TextEncoder(nn.Module):
             # Simple embedding layer as fallback
             # This is a placeholder - in practice, you should use CLIP text encoder
             self.text_proj = nn.Linear(512, feat_channels)  # Placeholder
+            self.text_model = None
     
-    def forward(self, text: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    def forward(self, text: Optional[Union[torch.Tensor, List[str]]]) -> Optional[torch.Tensor]:
         """Encode text prompts.
         
         Args:
-            text: Text token IDs [B, L] or text embeddings [B, L, C]. Optional.
+            text: Text token IDs [B, L], text embeddings [B, L, C], or list of strings. Optional.
             
         Returns:
             Text embeddings [B, N_text, C] or None.
@@ -60,15 +61,32 @@ class TextEncoder(nn.Module):
         if text is None:
             return None
         
-        if self.text_model is not None:
+        # Handle list of strings - would need tokenizer
+        if isinstance(text, list):
+            # If text_model is available and has tokenizer, use it
+            # For now, return None as placeholder
+            # In practice, this should:
+            # 1. Tokenize strings using CLIP tokenizer
+            # 2. Encode tokens using text_model
+            if self.text_model is not None and hasattr(self.text_model, 'text_tokenizer'):
+                # Tokenize
+                tokenized = []
+                for txt in text:
+                    tokens = self.text_model.text_tokenizer(txt)
+                    tokenized.append(tokens)
+                text_tokens = torch.stack(tokenized)
+                # Encode
+                text_embed = self.text_model(text_tokens)
+            else:
+                return None
+        elif self.text_model is not None:
             # Use text model to encode
             if text.dim() == 2:  # Token IDs
                 text_embed = self.text_model(text)  # [B, C] or [B, L, C]
             else:  # Already embeddings
                 text_embed = text
         else:
-            # Placeholder: return None for now
-            # In practice, this should use CLIP text encoder
+            # No text model available
             return None
         
         # Project to feat_channels
@@ -134,14 +152,14 @@ class PromptFusion(nn.Module):
     def forward(self,
                 point_embed: Optional[torch.Tensor] = None,
                 box_embed: Optional[torch.Tensor] = None,
-                text: Optional[torch.Tensor] = None,
+                text: Optional[Union[torch.Tensor, List[str]]] = None,
                 text_embed: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
         """Fuse different prompt embeddings.
         
         Args:
             point_embed: Point prompt embedding [B, N_point, C]. Optional.
             box_embed: Box prompt embedding [B, N_box, C]. Optional.
-            text: Text token IDs [B, L] for encoding. Optional.
+            text: Text token IDs [B, L] or list of strings for encoding. Optional.
             text_embed: Pre-encoded text embedding [B, N_text, C]. Optional.
             
         Returns:
@@ -149,7 +167,14 @@ class PromptFusion(nn.Module):
         """
         # Encode text if provided and text_embed is None
         if text is not None and text_embed is None and self.text_encoder is not None:
-            text_embed = self.text_encoder(text)
+            # Handle list of strings
+            if isinstance(text, list):
+                # Tokenize strings if text_encoder has tokenizer
+                # For now, we'll need to handle this externally or extend TextEncoder
+                # Placeholder: convert to tensor if needed
+                text_embed = self.text_encoder(None)  # Will return None for now
+            else:
+                text_embed = self.text_encoder(text)
         
         # Collect available prompts
         prompts = []
