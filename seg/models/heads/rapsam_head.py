@@ -206,6 +206,25 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         all_cls_scores = []
         all_masks_preds = []
         all_iou_preds = []
+        
+        # Apply prompt fusion if enabled and routing config indicates interactive task
+        fused_prompts = None
+        if self.use_prompt_fusion and self.routing_config:
+            task_config = self.routing_config.get('task_specific_config', {})
+            if task_config.get('enable_prompt_fusion', False):
+                # Extract prompts from data samples
+                point_embed, box_embed, text_embed, text_tokens = self._extract_prompt_embeddings(
+                    batch_data_samples, batch_img_metas
+                )
+                # Fuse prompts
+                if point_embed is not None or box_embed is not None or text_embed is not None or text_tokens is not None:
+                    fused_prompts = self.prompt_fusion_module(
+                        point_embed=point_embed,
+                        box_embed=box_embed,
+                        text=text_tokens,
+                        text_embed=text_embed
+                    )
+        
         if self.prompt_training:
             input_query_label, input_query_bbox, self_attn_mask, mask_dict = self.prepare_for_dn_mo(
                 batch_data_samples)
@@ -442,3 +461,52 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                     pass
             
             return loss_cls, loss_mask, loss_dice, loss_iou
+    
+    def _extract_prompt_embeddings(self,
+                                   batch_data_samples: SampleList,
+                                   batch_img_metas: List) -> Tuple:
+        """Extract prompt embeddings from data samples for prompt fusion.
+        
+        Args:
+            batch_data_samples: List of data samples.
+            batch_img_metas: List of image metadata.
+            
+        Returns:
+            Tuple of (point_embed, box_embed, text_embed, text_tokens), each can be None.
+        """
+        point_embed = None
+        box_embed = None
+        text_embed = None
+        text_tokens = None
+        
+        # Extract from first sample as example
+        if not batch_data_samples:
+            return point_embed, box_embed, text_embed, text_tokens
+        
+        first_sample = batch_data_samples[0]
+        
+        # Extract point embeddings from gt_instances_collected
+        if hasattr(first_sample, 'gt_instances_collected') and first_sample.gt_instances_collected is not None:
+            if hasattr(first_sample.gt_instances_collected, 'point_coords'):
+                # Point embeddings would be encoded by SAMPromptEncoder
+                # For now, return None - actual implementation would use SAMPromptEncoder
+                # TODO: Integrate with SAMPromptEncoder to get actual embeddings
+                pass
+        
+        # Extract box embeddings
+        if hasattr(first_sample, 'gt_instances') and first_sample.gt_instances is not None:
+            if hasattr(first_sample.gt_instances, 'bboxes') and len(first_sample.gt_instances.bboxes) > 0:
+                # Box embeddings would be encoded by SAMPromptEncoder
+                # For now, return None - actual implementation would use SAMPromptEncoder
+                # TODO: Integrate with SAMPromptEncoder to get actual embeddings
+                pass
+        
+        # Extract text from metainfo
+        if hasattr(first_sample, 'metainfo') and 'text' in first_sample.metainfo:
+            text_str = first_sample.metainfo['text']
+            # Text tokens would be tokenized here
+            # For now, return None - actual implementation would use CLIP tokenizer
+            # TODO: Integrate with CLIP tokenizer to get text tokens
+            pass
+        
+        return point_embed, box_embed, text_embed, text_tokens
