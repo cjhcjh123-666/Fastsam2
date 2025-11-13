@@ -8,6 +8,7 @@ from mmdet.models.backbones import ResNet
 from seg.models.necks.ramsam_neck import YOSONeck
 from seg.models.heads.rapsam_head import RapSAMVideoHead
 from seg.models.detectors.rapsam import RapSAM
+from seg.models.backbones.openclip_backbone import OpenCLIPBackboneText  # Import to register
 
 from seg.models.data_preprocessor.vid_sam_preprocessor import VideoPromptDataPreprocessor
 with read_base():
@@ -75,7 +76,7 @@ prompt_fusion = dict(
         # text_model_cfg can be added here for CLIP text encoder
         # Example:
         text_model_cfg=dict(
-            type='OpenCLIPBackboneText',
+            type=OpenCLIPBackboneText,
             model_name='ViT-L-14',
             init_cfg=dict(type='clip_pretrain', checkpoint='/mnt/chenjiahui/Fastsam2-main/checkpoints/openclip_vitl14_pretrain.pt')
         )
