@@ -27,7 +27,10 @@ from mmdet.models.utils import multi_apply, preprocess_panoptic_gt, get_uncertai
 from mmdet.models.dense_heads.anchor_free_head import AnchorFreeHead
 
 from seg.models.necks import SAMPromptEncoder
-from seg.models.utils import preprocess_video_panoptic_gt, mask_pool
+from seg.models.utils import (
+    preprocess_video_panoptic_gt, mask_pool,
+    PromptFusion, StreamingMemoryAdapter
+)
 
 from mmcv.cnn.bricks.transformer import FFN, MultiheadAttention
 
@@ -61,11 +64,36 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                  init_cfg: OptMultiConfig = None,
                  matching_whole_map: bool = False,
                  enable_box_query: bool = False,
+                 use_task_router: bool = False,
+                 use_streaming_memory: bool = False,
+                 use_prompt_fusion: bool = False,
+                 streaming_memory: OptConfigType = None,
+                 prompt_fusion: OptConfigType = None,
                  **kwargs) -> None:
         super(AnchorFreeHead, self).__init__(init_cfg=init_cfg)
         self.prompt_with_kernel_updator = prompt_with_kernel_updator
         self.panoptic_with_kernel_updator = panoptic_with_kernel_updator
         self.use_adaptor = use_adaptor
+        
+        # Multi-task components
+        self.use_task_router = use_task_router
+        self.use_streaming_memory = use_streaming_memory
+        self.use_prompt_fusion = use_prompt_fusion
+        self.routing_config = None  # Will be set by detector via set_routing_config
+        
+        if use_streaming_memory:
+            if streaming_memory is None:
+                streaming_memory = dict(type='StreamingMemoryAdapter')
+            self.streaming_memory = MODELS.build(streaming_memory)
+        else:
+            self.streaming_memory = None
+        
+        if use_prompt_fusion:
+            if prompt_fusion is None:
+                prompt_fusion = dict(type='PromptFusion')
+            self.prompt_fusion_module = MODELS.build(prompt_fusion)
+        else:
+            self.prompt_fusion_module = None
 
         self.num_mask_tokens = num_mask_tokens
         self.mask_tokens = nn.Embedding(num_mask_tokens, feat_channels)
@@ -146,6 +174,20 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
     def init_weights(self) -> None:
         pass
     
+    def set_routing_config(self, routing_config: Optional[Dict]):
+        """Set routing configuration from TaskRouter.
+        
+        Args:
+            routing_config: Routing configuration dict from TaskRouter.
+        """
+        self.routing_config = routing_config
+        if routing_config:
+            # Update num_stages based on routing config
+            if 'num_stages' in routing_config:
+                # Note: This is a runtime config, actual stages are already built
+                # We can use this to control which stages to use
+                pass
+    
     def forward(self, x, batch_data_samples: SampleList) -> Tuple[List[Tensor]]:
         batch_img_metas = []
         if isinstance(batch_data_samples[0], TrackDataSample):
@@ -174,6 +216,15 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
             object_kernels = self.kernels.weight[None].repeat(bs, 1, 1)
             self_attn_mask = None
         mask_features = x
+        
+        # Apply streaming memory for VOS tasks
+        if self.use_streaming_memory and self.routing_config and num_frames > 1:
+            task_config = self.routing_config.get('task_specific_config', {})
+            if task_config.get('enable_mask_propagation', False):
+                # Apply memory enhancement (placeholder - actual implementation needed)
+                # This would use streaming_memory to enhance features
+                pass
+        
         if num_frames > 0: # (bs*num_frames, c, h, w) -> (bs, c, num_frames*h, w)
             mask_features = mask_features.unflatten(0, (bs, num_frames))
             mask_features = mask_features.transpose(1, 2).flatten(2, 3)
@@ -381,4 +432,13 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                     loss_iou += p.sum() * 0.0
                 for n, p in self.prompt_iou.named_parameters():
                     loss_iou += p.sum() * 0.0
+            
+            # Add task-specific losses if needed (e.g., DPSR for VOS)
+            if self.routing_config:
+                task_config = self.routing_config.get('task_specific_config', {})
+                if task_config.get('enable_dpsr', False):
+                    # DPSR loss would be computed here
+                    # For now, it's handled in the detector's loss method
+                    pass
+            
             return loss_cls, loss_mask, loss_dice, loss_iou
