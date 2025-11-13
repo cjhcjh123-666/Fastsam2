@@ -304,8 +304,21 @@ class RapSAM(Mask2formerVideo):
                         curr_idx = (curr_ids == inst_id).nonzero(as_tuple=True)[0]
                         
                         if len(prev_idx) > 0 and len(curr_idx) > 0:
-                            prev_mask = prev_masks[prev_idx[0]].float()
-                            curr_mask = curr_masks[curr_idx[0]].float()
+                            # Convert BitmapMasks to tensor if needed
+                            from mmdet.structures.mask import BitmapMasks
+                            if isinstance(prev_masks, BitmapMasks):
+                                prev_mask = prev_masks[prev_idx[0]].to_tensor(dtype=torch.float32, device=prev_ids.device)
+                            elif isinstance(prev_masks, torch.Tensor):
+                                prev_mask = prev_masks[prev_idx[0]].float()
+                            else:
+                                prev_mask = torch.tensor(prev_masks[prev_idx[0]], dtype=torch.float32, device=prev_ids.device)
+                            
+                            if isinstance(curr_masks, BitmapMasks):
+                                curr_mask = curr_masks[curr_idx[0]].to_tensor(dtype=torch.float32, device=curr_ids.device)
+                            elif isinstance(curr_masks, torch.Tensor):
+                                curr_mask = curr_masks[curr_idx[0]].float()
+                            else:
+                                curr_mask = torch.tensor(curr_masks[curr_idx[0]], dtype=torch.float32, device=curr_ids.device)
                             
                             # Ensure same spatial size
                             if prev_mask.shape != curr_mask.shape:
