@@ -69,6 +69,34 @@ class PackVidSegInputs(BaseTransform):
         # 1. Pack images
         if 'img' in results:
             imgs = results['img']
+            # 检查所有图像是否具有相同的形状
+            shapes = [img.shape for img in imgs]
+            if len(set(shapes)) > 1:
+                # 如果形状不一致，填充到最大尺寸
+                max_h = max(shape[0] for shape in shapes)
+                max_w = max(shape[1] for shape in shapes)
+                
+                padded_imgs = []
+                for img in imgs:
+                    h, w = img.shape[:2]
+                    
+                    # 计算需要填充的像素数
+                    pad_h = max_h - h
+                    pad_w = max_w - w
+                    
+                    if pad_h > 0 or pad_w > 0:
+                        # 使用右下角填充（与 mmdet 的默认行为一致）
+                        if len(img.shape) == 3:
+                            padded_img = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), 
+                                              mode='constant', constant_values=0)
+                        else:
+                            padded_img = np.pad(img, ((0, pad_h), (0, pad_w)), 
+                                              mode='constant', constant_values=0)
+                        padded_imgs.append(padded_img)
+                    else:
+                        padded_imgs.append(img)
+                imgs = padded_imgs
+            
             imgs = np.stack(imgs, axis=0)
             imgs = imgs.transpose(0, 3, 1, 2)
             packed_results['inputs'] = to_tensor(imgs)
