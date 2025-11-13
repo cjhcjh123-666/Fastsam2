@@ -87,18 +87,20 @@ class StreamingMemoryAdapter(nn.Module):
             # Convert BitmapMasks to tensor
             mask_tensor = mask.to_tensor(dtype=torch.float32, device=instance_embed.device)
         elif isinstance(mask, torch.Tensor):
-            mask_tensor = mask.detach() if mask.requires_grad else mask
+            mask_tensor = mask  # Keep gradients for training
         else:
             # Try to convert to tensor
             mask_tensor = torch.tensor(mask, dtype=torch.float32, device=instance_embed.device)
         
         # Update short-term memory (FIFO)
+        # Note: We keep gradients for training, but can detach for inference if needed
+        # For training, we need gradients to flow through memory update network
         mem_entry = {
             'frame_id': frame_id,
-            'embed': instance_embed.detach() if instance_embed.requires_grad else instance_embed,
+            'embed': instance_embed,  # Keep gradients for training
             'mask': mask_tensor,
             'instance_id': instance_id,
-            'text_embed': text_embed.detach() if text_embed is not None and text_embed.requires_grad else text_embed
+            'text_embed': text_embed  # Keep gradients for training
         }
         
         self.short_mem.append(mem_entry)
@@ -132,8 +134,8 @@ class StreamingMemoryAdapter(nn.Module):
             all_embeds = torch.stack(all_embeds)
             
             # Compute quality scores
-            with torch.no_grad():
-                scores = self.quality_scorer(all_embeds.mean(dim=1))
+            # Keep gradients for training (quality scorer needs gradients)
+            scores = self.quality_scorer(all_embeds.mean(dim=1))
             
             # Keep top-k frames
             _, top_indices = torch.topk(scores.squeeze(), self.long_mem_size)
