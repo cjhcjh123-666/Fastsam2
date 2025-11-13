@@ -89,7 +89,7 @@ prompt_encoder = dict(
     fix=True,
     init_cfg=dict(
         type='sam_pretrain',
-        checkpoint='sam_vit_h'
+        checkpoint='vit_h'  # Valid keys: 'vit_h', 'vit_l', 'vit_b'
     )
 )
 
