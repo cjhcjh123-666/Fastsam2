@@ -155,6 +155,33 @@ class RapSAM(Mask2formerVideo):
             if dpsr_loss is not None:
                 losses['loss_dpsr'] = dpsr_loss
         
+        # CRITICAL for DDP: Add dummy loss to ensure all parameters have gradients
+        # This prevents "Expected to have finished reduction in the prior iteration" errors
+        # The dummy loss has coefficient 0.0, so it doesn't affect training
+        if self.training:
+            dummy_loss = 0.0
+            
+            # Ensure TextEncoder parameters have gradients (used only with RefCOCO data)
+            if hasattr(self.panoptic_head, 'prompt_fusion_module'):
+                prompt_fusion = self.panoptic_head.prompt_fusion_module
+                if prompt_fusion is not None and hasattr(prompt_fusion, 'text_encoder'):
+                    text_encoder = prompt_fusion.text_encoder
+                    if text_encoder is not None:
+                        for param in text_encoder.parameters():
+                            if param.requires_grad:
+                                dummy_loss = dummy_loss + 0.0 * param.sum()
+            
+            # Ensure StreamingMemory parameters have gradients (used only with video data)
+            if hasattr(self.panoptic_head, 'streaming_memory'):
+                streaming_memory = self.panoptic_head.streaming_memory
+                if streaming_memory is not None:
+                    for param in streaming_memory.parameters():
+                        if param.requires_grad:
+                            dummy_loss = dummy_loss + 0.0 * param.sum()
+            
+            # Add dummy loss (coefficient 0.0 means no impact on training, but ensures gradient flow)
+            losses['loss_dummy_ddp'] = dummy_loss
+        
         return losses
     
     def predict(self,

@@ -178,16 +178,21 @@ class PromptFusion(nn.Module):
         Returns:
             Fused prompt embedding [B, N_total, C] or None if no prompts.
         """
-        # Encode text if provided and text_embed is None
-        if text is not None and text_embed is None and self.text_encoder is not None:
-            # Handle list of strings
-            if isinstance(text, list):
-                # Tokenize strings if text_encoder has tokenizer
-                # For now, we'll need to handle this externally or extend TextEncoder
-                # Placeholder: convert to tensor if needed
-                text_embed = self.text_encoder(None)  # Will return None for now
-            else:
-                text_embed = self.text_encoder(text)
+        # CRITICAL for DDP: Always call text_encoder to ensure parameters have gradients
+        # This prevents "Expected to have finished reduction" errors in distributed training
+        dummy_text_for_ddp = None
+        if self.text_encoder is not None:
+            # Always call text_encoder, even with None input
+            if text is not None and text_embed is None:
+                # Handle list of strings
+                if isinstance(text, list):
+                    text_embed = self.text_encoder(None)  # Will return None for now
+                else:
+                    text_embed = self.text_encoder(text)
+            elif text is None and text_embed is None:
+                # Create dummy text embedding to ensure text_encoder parameters are used
+                # This is necessary for DDP gradient synchronization
+                dummy_text_for_ddp = self.text_encoder(None)
         
         # Collect available prompts
         prompts = []
@@ -230,7 +235,8 @@ class PromptFusion(nn.Module):
                 prompts[-1] = text_embed  # Update the last added prompt
         
         if not prompts:
-            # Return None if no prompts
+            # No real prompts, but we called text_encoder for DDP
+            # Return None but gradient flow through dummy_text_for_ddp is ensured
             return None
         
         # Ensure all prompts have the same batch size

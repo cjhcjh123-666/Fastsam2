@@ -236,41 +236,41 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         all_masks_preds = []
         all_iou_preds = []
         
-        # Apply prompt fusion if enabled and routing config indicates interactive task
-        # Note: With find_unused_parameters=True in DDP config, it's safe to skip calling
-        # prompt_fusion_module when there are no prompts
+        # Apply prompt fusion if enabled
+        # CRITICAL for DDP: ALWAYS call prompt_fusion_module to ensure all parameters have gradients
+        # This prevents "Expected to have finished reduction in the prior iteration" errors
         fused_prompts = None
         if self.use_prompt_fusion and self.prompt_fusion_module is not None:
-            if self.routing_config:
-                task_config = self.routing_config.get('task_specific_config', {})
-                enable_prompt_fusion = task_config.get('enable_prompt_fusion', False)
-            else:
-                enable_prompt_fusion = True  # Default to True if no routing config
+            # Get device
+            device = x[0].device if isinstance(x, (list, tuple)) else x.device
             
             # Extract prompts from data samples
             point_embed, box_embed, text_embed, text_tokens = self._extract_prompt_embeddings(
                 batch_data_samples, batch_img_metas
             )
             
-            # Only call prompt_fusion_module if we have actual prompts
-            # DDP unused parameters are handled by find_unused_parameters=True in config
-            if point_embed is not None or box_embed is not None or text_embed is not None or text_tokens is not None:
-                # Ensure all embeddings are on the same device as the model
-                device = x[0].device if isinstance(x, (list, tuple)) else x.device
+            # ALWAYS call prompt_fusion_module, even with None inputs
+            # This ensures TextEncoder and other sub-modules participate in forward pass
+            # When inputs are None, the module should handle it gracefully (return None or zero tensor)
+            has_real_prompts = (point_embed is not None or box_embed is not None or 
+                               text_embed is not None or text_tokens is not None)
+            
+            if has_real_prompts:
+                # Move embeddings to device
                 if point_embed is not None:
                     point_embed = point_embed.to(device)
                 if box_embed is not None:
                     box_embed = box_embed.to(device)
                 if text_embed is not None:
                     text_embed = text_embed.to(device)
-                
-                # Fuse actual prompts
-                fused_prompts = self.prompt_fusion_module(
-                    point_embed=point_embed,
-                    box_embed=box_embed,
-                    text=text_tokens,
-                    text_embed=text_embed
-                )
+            
+            # ALWAYS call, even with None inputs (for DDP gradient sync)
+            fused_prompts = self.prompt_fusion_module(
+                point_embed=point_embed,
+                box_embed=box_embed,
+                text=text_tokens,
+                text_embed=text_embed
+            )
         
         if self.prompt_training:
             input_query_label, input_query_bbox, self_attn_mask, mask_dict = self.prepare_for_dn_mo(
