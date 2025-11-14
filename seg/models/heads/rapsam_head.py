@@ -546,8 +546,29 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                 points_coords = get_uncertain_point_coords_with_randomness(
                     mask_preds.unsqueeze(1), None, self.num_points,
                     self.oversample_ratio, self.importance_sample_ratio)
+                
+                # Fix batch size mismatch: mask_targets may have fewer masks than mask_preds
+                # In prompt training, each query should correspond to a mask target
+                # If mask_targets has fewer masks, we need to expand it to match mask_preds
+                num_pred_masks = mask_preds.shape[0]  # [num_valid_preds, H, W]
+                num_target_masks = mask_targets.shape[0]  # [num_targets, H, W]
+                
+                if num_target_masks < num_pred_masks:
+                    # Repeat mask_targets to match num_pred_masks
+                    # This happens when we have more queries than ground truth masks
+                    repeat_times = (num_pred_masks // num_target_masks) + 1
+                    mask_targets_expanded = mask_targets.repeat(repeat_times, 1, 1)[:num_pred_masks]
+                elif num_target_masks > num_pred_masks:
+                    # Truncate mask_targets to match num_pred_masks
+                    mask_targets_expanded = mask_targets[:num_pred_masks]
+                else:
+                    mask_targets_expanded = mask_targets
+                
+                # Ensure mask_targets_expanded has the same batch dimension as points_coords
+                # points_coords shape: [num_pred_masks, num_points, 1, 2]
+                # mask_targets_expanded shape: [num_pred_masks, H, W]
                 mask_point_targets = point_sample(
-                    mask_targets.unsqueeze(1).float(), points_coords).squeeze(1)
+                    mask_targets_expanded.unsqueeze(1).float(), points_coords).squeeze(1)
 
             mask_point_preds = point_sample(mask_preds.unsqueeze(1),
                                             points_coords).squeeze(1)
