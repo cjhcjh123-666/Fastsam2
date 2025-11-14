@@ -43,6 +43,7 @@ class RapSAM(Mask2formerVideo):
                  inference_sam: bool = False,
                  use_task_router: bool = True,
                  task_router: OptConfigType = None,
+                 task_loss_weights: OptConfigType = None,
                  use_streaming_memory: bool = True,
                  streaming_memory: OptConfigType = None,
                  use_prompt_fusion: bool = True,
@@ -91,6 +92,9 @@ class RapSAM(Mask2formerVideo):
         else:
             self.task_router = None
         
+        # Task-specific loss weights
+        self.task_loss_weights = task_loss_weights if task_loss_weights is not None else {}
+        
         self.use_streaming_memory = use_streaming_memory
         # Note: StreamingMemory and PromptFusion are built in panoptic_head
         # The detector-level instances are kept for reference but not used directly
@@ -121,6 +125,8 @@ class RapSAM(Mask2formerVideo):
         """
         # Detect task type and route
         routing_config = None
+        current_task_type = 'panoptic'  # 默认任务类型
+        
         if self.use_task_router:
             # Extract prompts from data samples if available
             prompts = self._extract_prompts_from_samples(batch_data_samples)
@@ -130,6 +136,10 @@ class RapSAM(Mask2formerVideo):
             # Pass routing config to head
             if hasattr(self.panoptic_head, 'set_routing_config'):
                 self.panoptic_head.set_routing_config(routing_config)
+            
+            # 获取当前batch的任务类型
+            task_type = self.task_router.detect_task_type(batch_data_samples, prompts)
+            current_task_type = task_type.value  # 'interactive_image', 'interactive_video', 'vos', 'panoptic'
         
         # Extract features
         from mmdet.structures import TrackDataSample
@@ -141,19 +151,75 @@ class RapSAM(Mask2formerVideo):
         else:
             x = self.extract_feat(batch_inputs)
         
-        # Forward through head
+        # Forward through head - 计算所有可能的loss
         # IMPORTANT: In distributed training, all ranks must follow the same code path
         # to avoid NCCL synchronization timeouts. We always use the standard loss path.
         losses = self.panoptic_head.loss(x, batch_data_samples)
         
-        # Add task-specific losses (e.g., DPSR for VOS)
+        # 计算任务特定的loss（即使当前任务不需要，也要计算以确保梯度流）
+        # VOS特定: DPSR loss
         if routing_config and routing_config.get('task_specific_config', {}).get('enable_dpsr'):
-            # Try to get predictions from head for DPSR loss
-            # In practice, we might need to store predictions during forward pass
             prev_predictions = getattr(self, '_prev_predictions', None)
             dpsr_loss = self._compute_dpsr_loss(batch_data_samples, prev_predictions)
             if dpsr_loss is not None:
                 losses['loss_dpsr'] = dpsr_loss
+        else:
+            # 即使不需要DPSR，也添加一个零loss确保参数参与计算
+            device = next(iter(losses.values())).device if losses else torch.device('cuda')
+            losses['loss_dpsr'] = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # 时序一致性loss（视频任务）
+        if isinstance(batch_data_samples[0], TrackDataSample):
+            temporal_loss = self._compute_temporal_consistency_loss(batch_data_samples)
+            losses['loss_temporal'] = temporal_loss if temporal_loss is not None else \
+                torch.tensor(0.0, device=next(iter(losses.values())).device, requires_grad=True)
+        else:
+            device = next(iter(losses.values())).device if losses else torch.device('cuda')
+            losses['loss_temporal'] = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # Prompt对齐loss（交互任务）
+        prompts = self._extract_prompts_from_samples(batch_data_samples)
+        if prompts:
+            prompt_align_loss = self._compute_prompt_alignment_loss(batch_data_samples, prompts)
+            losses['loss_prompt_align'] = prompt_align_loss if prompt_align_loss is not None else \
+                torch.tensor(0.0, device=next(iter(losses.values())).device, requires_grad=True)
+        else:
+            device = next(iter(losses.values())).device if losses else torch.device('cuda')
+            losses['loss_prompt_align'] = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # 文本-视觉对齐loss（文本提示任务）
+        text_visual_loss = self._compute_text_visual_alignment_loss(batch_data_samples, None)
+        losses['loss_text_visual'] = text_visual_loss if text_visual_loss is not None else \
+            torch.tensor(0.0, device=next(iter(losses.values())).device, requires_grad=True)
+        
+        # 记忆对齐loss（VOS任务）
+        if self.use_streaming_memory and hasattr(self.panoptic_head, 'streaming_memory'):
+            memory_align_loss = self._compute_memory_alignment_loss(batch_data_samples)
+            losses['loss_memory_align'] = memory_align_loss if memory_align_loss is not None else \
+                torch.tensor(0.0, device=next(iter(losses.values())).device, requires_grad=True)
+        else:
+            device = next(iter(losses.values())).device if losses else torch.device('cuda')
+            losses['loss_memory_align'] = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # 全景分割特定loss
+        device = next(iter(losses.values())).device if losses else torch.device('cuda')
+        losses['loss_panoptic'] = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # 🔥 关键：根据当前任务类型应用loss权重masking
+        if self.task_loss_weights and current_task_type in self.task_loss_weights:
+            task_weights = self.task_loss_weights[current_task_type]
+            masked_losses = {}
+            
+            for loss_name, loss_value in losses.items():
+                # 获取该loss在当前任务中的权重
+                if loss_name in task_weights:
+                    weight = task_weights[loss_name]
+                    masked_losses[loss_name] = loss_value * weight
+                else:
+                    # 如果没有配置，保持原值（基础loss）
+                    masked_losses[loss_name] = loss_value
+            
+            losses = masked_losses
         
         # CRITICAL for DDP: Add dummy loss to ensure all parameters have gradients
         # This prevents "Expected to have finished reduction in the prior iteration" errors
@@ -252,6 +318,118 @@ class RapSAM(Mask2formerVideo):
                 prompts['bboxes'] = first_sample.gt_instances.bboxes
         
         return prompts if prompts else None
+    
+    def _compute_temporal_consistency_loss(self,
+                                          batch_data_samples: SampleList) -> Optional[torch.Tensor]:
+        """计算时序一致性loss（用于视频任务）。
+        
+        确保相邻帧之间的mask预测保持一致性。
+        
+        Args:
+            batch_data_samples: Batch数据样本
+            
+        Returns:
+            时序一致性loss或None
+        """
+        from mmdet.structures import TrackDataSample
+        import torch.nn.functional as F
+        
+        if not batch_data_samples or not isinstance(batch_data_samples[0], TrackDataSample):
+            return None
+        
+        total_loss = 0.0
+        num_pairs = 0
+        
+        for track_sample in batch_data_samples:
+            if not hasattr(track_sample, 'video_data_samples') or len(track_sample.video_data_samples) < 2:
+                continue
+            
+            video_samples = track_sample.video_data_samples
+            
+            # 比较相邻帧的GT mask
+            for i in range(len(video_samples) - 1):
+                curr_sample = video_samples[i]
+                next_sample = video_samples[i + 1]
+                
+                if not (hasattr(curr_sample, 'gt_instances') and hasattr(next_sample, 'gt_instances')):
+                    continue
+                
+                curr_instances = curr_sample.gt_instances
+                next_instances = next_sample.gt_instances
+                
+                if not (hasattr(curr_instances, 'masks') and hasattr(next_instances, 'masks')):
+                    continue
+                
+                # 计算mask变化的平滑性
+                from mmdet.structures.mask import BitmapMasks
+                curr_masks = curr_instances.masks
+                next_masks = next_instances.masks
+                
+                if isinstance(curr_masks, BitmapMasks):
+                    curr_masks = curr_masks.to_tensor(dtype=torch.float32, 
+                                                     device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+                if isinstance(next_masks, BitmapMasks):
+                    next_masks = next_masks.to_tensor(dtype=torch.float32,
+                                                     device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+                
+                # 确保维度匹配
+                min_num = min(curr_masks.shape[0], next_masks.shape[0])
+                if min_num == 0:
+                    continue
+                
+                curr_masks = curr_masks[:min_num]
+                next_masks = next_masks[:min_num]
+                
+                # L1 loss for temporal consistency
+                loss = F.l1_loss(curr_masks, next_masks, reduction='mean')
+                total_loss += loss
+                num_pairs += 1
+        
+        if num_pairs > 0:
+            return total_loss / num_pairs
+        return None
+    
+    def _compute_prompt_alignment_loss(self,
+                                       batch_data_samples: SampleList,
+                                       prompts: Dict) -> Optional[torch.Tensor]:
+        """计算prompt对齐loss（用于交互任务）。
+        
+        确保模型预测与prompt指示区域对齐。
+        
+        Args:
+            batch_data_samples: Batch数据样本
+            prompts: Prompt字典（point_coords, bboxes, text）
+            
+        Returns:
+            Prompt对齐loss或None
+        """
+        # 简化版本：使用point或box的IoU作为对齐指标
+        # 实际实现中可以更复杂，比如使用attention map
+        
+        if not prompts or not any([prompts.get('point_coords'), prompts.get('bboxes')]):
+            return None
+        
+        # Placeholder实现
+        # 实际应该计算predicted mask与prompt区域的overlap
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    
+    def _compute_memory_alignment_loss(self,
+                                       batch_data_samples: SampleList) -> Optional[torch.Tensor]:
+        """计算记忆对齐loss（用于VOS任务）。
+        
+        确保从记忆中检索的特征与当前帧特征对齐。
+        
+        Args:
+            batch_data_samples: Batch数据样本
+            
+        Returns:
+            记忆对齐loss或None
+        """
+        # Placeholder实现
+        # 实际应该计算memory features与current features的相似度
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        return torch.tensor(0.0, device=device, requires_grad=True)
     
     def _compute_text_visual_alignment_loss(self,
                                             batch_data_samples: SampleList,

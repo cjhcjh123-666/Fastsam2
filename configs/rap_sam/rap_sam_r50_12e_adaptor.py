@@ -56,6 +56,77 @@ task_router = dict(
     panoptic_stages=3
 )
 
+# Task-specific loss weights configuration
+# 当batch属于某个任务时，只有对应的loss生效，其他任务的loss权重为0
+# 这样可以避免不同任务之间的loss冲突，同时保证所有模块都参与梯度计算
+task_loss_weights = dict(
+    # 图像交互分割（点、框、文本提示）
+    interactive_image=dict(
+        # 基础loss（共享）
+        loss_cls=1.0,      # 分类loss
+        loss_mask=5.0,     # mask loss
+        loss_dice=5.0,     # dice loss
+        loss_iou=10.0,     # IoU预测loss
+        # 任务特定loss
+        loss_prompt_align=0.5,    # prompt对齐loss
+        loss_text_visual=0.3,     # 文本-视觉对齐loss（仅文本提示时）
+        # 屏蔽其他任务的loss
+        loss_dpsr=0.0,            # VOS的DPSR loss
+        loss_temporal=0.0,        # 视频时序loss
+        loss_panoptic=0.0,        # 全景分割loss
+    ),
+    
+    # 视频交互分割（点、框、文本提示 + 视频）
+    interactive_video=dict(
+        # 基础loss
+        loss_cls=1.0,
+        loss_mask=5.0,
+        loss_dice=5.0,
+        loss_iou=10.0,
+        # 任务特定loss
+        loss_prompt_align=0.5,
+        loss_text_visual=0.3,
+        loss_temporal=1.0,        # 时序一致性loss
+        # 屏蔽其他任务的loss
+        loss_dpsr=0.0,
+        loss_panoptic=0.0,
+    ),
+    
+    # VOS (视频对象分割，无prompt)
+    vos=dict(
+        # 基础loss
+        loss_cls=1.0,
+        loss_mask=5.0,
+        loss_dice=5.0,
+        loss_iou=0.0,             # VOS不需要IoU预测
+        # 任务特定loss
+        loss_dpsr=2.0,            # 双路径自优化loss
+        loss_temporal=1.5,        # 时序一致性loss
+        loss_memory_align=1.0,    # 记忆对齐loss
+        # 屏蔽其他任务的loss
+        loss_prompt_align=0.0,
+        loss_text_visual=0.0,
+        loss_panoptic=0.0,
+    ),
+    
+    # 全景分割（无prompt，图像级）
+    panoptic=dict(
+        # 基础loss
+        loss_cls=2.0,             # 全景分割需要更强的分类约束
+        loss_mask=5.0,
+        loss_dice=5.0,
+        loss_iou=0.0,
+        # 任务特定loss
+        loss_panoptic=1.0,        # 全景分割特定loss
+        # 屏蔽其他任务的loss
+        loss_prompt_align=0.0,
+        loss_text_visual=0.0,
+        loss_dpsr=0.0,
+        loss_temporal=0.0,
+        loss_memory_align=0.0,
+    ),
+)
+
 streaming_memory = dict(
     type='StreamingMemoryAdapter',
     feat_channels=256,
@@ -100,6 +171,7 @@ model = dict(
     # Multi-task configuration
     use_task_router=True,
     task_router=task_router,
+    task_loss_weights=task_loss_weights,  # 传递任务特定loss权重
     use_streaming_memory=True,
     streaming_memory=streaming_memory,
     use_prompt_fusion=True,
@@ -197,4 +269,5 @@ test_cfg = None
 # Some modules (e.g., TextEncoder) are only used for specific data types (RefCOCO)
 # Others (e.g., StreamingMemory) are only used for video data (VOS)
 # In mixed dataset training, not all parameters are used in every forward pass
-find_unused_parameters = False
+# CRITICAL: Must be True to prevent NCCL timeout errors in distributed training
+find_unused_parameters = True
