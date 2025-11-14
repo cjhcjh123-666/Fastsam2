@@ -316,8 +316,39 @@ class RapSAM(Mask2formerVideo):
         text_list = []
         for data_sample in batch_data_samples:
             if hasattr(data_sample, 'metainfo') and 'text' in data_sample.metainfo:
-                text_list.append(data_sample.metainfo['text'])
-                has_text = True
+                text_raw = data_sample.metainfo['text']
+                # Convert to string immediately if it's a Tensor
+                if isinstance(text_raw, torch.Tensor):
+                    if text_raw.dim() == 0:
+                        text_clean = str(text_raw.item())
+                    elif text_raw.dim() == 1 and text_raw.numel() > 0:
+                        # Try to decode if it's token IDs, otherwise convert to string
+                        try:
+                            # If it looks like token IDs, skip (can't decode without tokenizer)
+                            text_clean = None
+                        except:
+                            text_clean = str(text_raw.tolist())
+                    else:
+                        text_clean = None
+                elif isinstance(text_raw, str):
+                    text_clean = text_raw
+                elif isinstance(text_raw, (list, tuple)):
+                    # If it's a list, try to join if all are strings
+                    if all(isinstance(t, str) for t in text_raw):
+                        text_clean = ' '.join(text_raw)
+                    else:
+                        text_clean = None
+                else:
+                    try:
+                        text_clean = str(text_raw)
+                    except:
+                        text_clean = None
+                
+                if text_clean is not None and isinstance(text_clean, str) and len(text_clean.strip()) > 0:
+                    text_list.append(text_clean)
+                    has_text = True
+                else:
+                    text_list.append(None)
             else:
                 text_list.append(None)
         
@@ -331,49 +362,15 @@ class RapSAM(Mask2formerVideo):
         text_encoder = self.prompt_fusion.text_encoder
         
         # Encode text prompts
+        # At this point, text_list should only contain strings or None
         text_embeds = []
         valid_indices = []
         for idx, text in enumerate(text_list):
-            if text is not None:
-                # Convert text to string if it's a Tensor or other type
-                if isinstance(text, torch.Tensor):
-                    # If text is a tensor, convert to string
-                    # Handle different tensor shapes
-                    if text.dim() == 0:
-                        # Scalar tensor
-                        text = str(text.item())
-                    elif text.dim() == 1:
-                        # 1D tensor, try to convert to string
-                        text = str(text.tolist())
-                    else:
-                        # Skip if tensor shape is not supported
-                        continue
-                elif not isinstance(text, str):
-                    # Try to convert to string
-                    try:
-                        text = str(text)
-                    except Exception:
-                        continue
-                
-                # Encode text (text should now be a string)
-                if isinstance(text, str) and len(text.strip()) > 0:
+            if text is not None and isinstance(text, str) and len(text.strip()) > 0:
+                try:
                     text_embed = text_encoder([text])  # TextEncoder expects list
-                elif isinstance(text, list):
-                    # Ensure all items in list are strings
-                    text_list_clean = []
-                    for t in text:
-                        if isinstance(t, torch.Tensor):
-                            if t.dim() == 0:
-                                text_list_clean.append(str(t.item()))
-                            else:
-                                continue
-                        elif isinstance(t, str):
-                            text_list_clean.append(t)
-                    if text_list_clean:
-                        text_embed = text_encoder(text_list_clean)
-                    else:
-                        continue
-                else:
+                except Exception as e:
+                    # Skip if encoding fails (e.g., text is still not a string)
                     continue
                 
                 if text_embed is not None:
