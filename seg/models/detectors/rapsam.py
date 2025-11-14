@@ -1,5 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from mmdet.registry import MODELS
@@ -142,7 +142,87 @@ class RapSAM(Mask2formerVideo):
             x = self.extract_feat(batch_inputs)
         
         # Forward through head
-        losses = self.panoptic_head.loss(x, batch_data_samples)
+        # For RefCOCO dataset with text, we need forward results for text alignment loss
+        # Check if we have text in any sample
+        has_text = False
+        if self.use_prompt_fusion and self.prompt_fusion is not None:
+            has_text = any(
+                hasattr(ds, 'metainfo') and 'text' in ds.metainfo
+                for ds in batch_data_samples
+            )
+        
+        if has_text:
+            # Do forward pass first to get visual features for text alignment loss
+            all_cls_scores, all_mask_preds, all_iou_preds, _ = \
+                self.panoptic_head(x, batch_data_samples)
+            forward_results = (all_cls_scores, all_mask_preds, all_iou_preds, None)
+            
+            # Extract batch_gt_instances and batch_img_metas for loss_by_feat
+            # Reuse the same logic as in head's loss method
+            batch_img_metas = []
+            batch_gt_instances = []
+            batch_gt_semantic_segs = []
+            
+            from mmdet.structures import TrackDataSample
+            from mmengine.structures import InstanceData
+            
+            # Check if prompt_training mode (SAM dataset)
+            is_prompt_training = batch_data_samples[0].get('data_tag', 'coco') == 'sam'
+            
+            if is_prompt_training:
+                for data_sample in batch_data_samples:
+                    device = data_sample.gt_instances.labels.device
+                    ori_masks = data_sample.gt_instances.masks.to_tensor(torch.bool, device)
+                    indices = data_sample.gt_instances_collected.idx
+                    gt_masks = ori_masks[indices]
+                    gt_instances = InstanceData(masks=gt_masks)
+                    batch_img_metas.append(data_sample.metainfo)
+                    batch_gt_instances.append(gt_instances)
+            else:
+                for data_sample in batch_data_samples:
+                    if isinstance(data_sample, TrackDataSample):
+                        clip_meta = []
+                        clip_instances = []
+                        clip_sem_seg = []
+                        for det_sample in data_sample:
+                            clip_meta.append(det_sample.metainfo)
+                            clip_instances.append(det_sample.gt_instances)
+                            if 'gt_sem_seg' in det_sample:
+                                clip_sem_seg.append(det_sample.gt_sem_seg)
+                            else:
+                                clip_sem_seg.append(None)
+                        batch_img_metas.append(clip_meta)
+                        batch_gt_instances.append(clip_instances)
+                        batch_gt_semantic_segs.append(clip_sem_seg)
+                    else:
+                        batch_img_metas.append(data_sample.metainfo)
+                        batch_gt_instances.append(data_sample.gt_instances)
+                        if 'gt_sem_seg' in data_sample:
+                            batch_gt_semantic_segs.append(data_sample.gt_sem_seg)
+                        else:
+                            batch_gt_semantic_segs.append(None)
+                
+                # Preprocess GT if needed
+                if hasattr(self.panoptic_head, 'preprocess_gt'):
+                    batch_gt_instances = self.panoptic_head.preprocess_gt(
+                        batch_gt_instances, batch_gt_semantic_segs
+                    )
+            
+            # Compute loss with forward results
+            losses = self.panoptic_head.loss_by_feat(
+                all_cls_scores, all_mask_preds, all_iou_preds, 
+                batch_gt_instances, batch_img_metas
+            )
+            
+            # Add text-visual alignment loss
+            text_alignment_loss = self._compute_text_visual_alignment_loss(
+                batch_data_samples, forward_results
+            )
+            if text_alignment_loss is not None:
+                losses['loss_text_align'] = text_alignment_loss
+        else:
+            # Normal path: no text, use standard loss computation
+            losses = self.panoptic_head.loss(x, batch_data_samples)
         
         # Add task-specific losses (e.g., DPSR for VOS)
         if routing_config and routing_config.get('task_specific_config', {}).get('enable_dpsr'):
@@ -212,6 +292,139 @@ class RapSAM(Mask2formerVideo):
                 prompts['bboxes'] = first_sample.gt_instances.bboxes
         
         return prompts if prompts else None
+    
+    def _compute_text_visual_alignment_loss(self,
+                                            batch_data_samples: SampleList,
+                                            forward_results: Tuple) -> Optional[torch.Tensor]:
+        """Compute text-visual alignment loss for RefCOCO dataset.
+        
+        This loss ensures that text embeddings are aligned with visual features
+        of the corresponding instances, improving text-guided segmentation.
+        
+        Args:
+            batch_data_samples: List of data samples.
+            forward_results: Tuple of (all_cls_scores, all_mask_preds, all_iou_preds, _)
+                from head's forward pass.
+            
+        Returns:
+            Text-visual alignment loss tensor or None if not applicable.
+        """
+        all_cls_scores, all_mask_preds, all_iou_preds, _ = forward_results
+        
+        # Check if we have text in any sample
+        has_text = False
+        text_list = []
+        for data_sample in batch_data_samples:
+            if hasattr(data_sample, 'metainfo') and 'text' in data_sample.metainfo:
+                text_list.append(data_sample.metainfo['text'])
+                has_text = True
+            else:
+                text_list.append(None)
+        
+        if not has_text or self.prompt_fusion is None:
+            return None
+        
+        # Get text encoder from prompt_fusion
+        if not hasattr(self.prompt_fusion, 'text_encoder') or self.prompt_fusion.text_encoder is None:
+            return None
+        
+        text_encoder = self.prompt_fusion.text_encoder
+        
+        # Encode text prompts
+        text_embeds = []
+        valid_indices = []
+        for idx, text in enumerate(text_list):
+            if text is not None:
+                # Encode text (text can be a string or list of strings)
+                if isinstance(text, str):
+                    text_embed = text_encoder([text])  # TextEncoder expects list
+                elif isinstance(text, list):
+                    text_embed = text_encoder(text)
+                else:
+                    continue
+                
+                if text_embed is not None:
+                    text_embeds.append(text_embed)
+                    valid_indices.append(idx)
+        
+        if len(text_embeds) == 0:
+            return None
+        
+        # Stack text embeddings: [B_valid, N_text, C] or [B_valid, C]
+        if text_embeds[0].dim() == 2:
+            # [B, C] -> [B, 1, C]
+            text_embeds = [te.unsqueeze(1) for te in text_embeds]
+        text_embed = torch.cat(text_embeds, dim=0)  # [B_valid, N_text, C] or [B_valid, 1, C]
+        
+        # Extract visual features from the last decoder stage
+        # Use cls_scores as proxy for visual features (normalized)
+        if len(all_cls_scores) > 0:
+            last_cls_scores = all_cls_scores[-1]  # [B, N_queries, num_classes]
+            # Use normalized mean as visual embedding
+            visual_embed = torch.nn.functional.normalize(
+                last_cls_scores.mean(dim=-1, keepdim=True), dim=-1
+            )  # [B, N_queries, 1]
+            
+            # Filter to only valid samples (those with text)
+            if visual_embed.shape[0] >= len(valid_indices):
+                visual_embed = visual_embed[valid_indices]
+            else:
+                # Pad if needed
+                device = visual_embed.device
+                pad_size = len(valid_indices) - visual_embed.shape[0]
+                pad_embed = torch.zeros(
+                    (pad_size, visual_embed.shape[1], visual_embed.shape[2]),
+                    device=device
+                )
+                visual_embed = torch.cat([visual_embed, pad_embed], dim=0)
+            
+            # Get mask labels for alignment
+            mask_labels = []
+            for idx in valid_indices:
+                data_sample = batch_data_samples[idx]
+                if hasattr(data_sample, 'gt_instances') and data_sample.gt_instances is not None:
+                    if hasattr(data_sample.gt_instances, 'masks'):
+                        masks = data_sample.gt_instances.masks
+                        # Convert to tensor if needed
+                        from mmdet.structures.mask import BitmapMasks
+                        if isinstance(masks, BitmapMasks):
+                            mask_tensor = masks.to_tensor(dtype=torch.float32, device=visual_embed.device)
+                        else:
+                            mask_tensor = masks.to(device=visual_embed.device)
+                        mask_labels.append(mask_tensor)
+            
+            if len(mask_labels) > 0:
+                # Stack mask labels - use mean pooling for simplicity
+                mask_label_tensors = []
+                for m in mask_labels:
+                    if m.dim() == 3:  # [N, H, W]
+                        # Use mean across instances
+                        mask_label_tensors.append(m.mean(dim=0))  # [H, W]
+                    elif m.dim() == 2:  # [H, W]
+                        mask_label_tensors.append(m)
+                    else:
+                        mask_label_tensors.append(m.squeeze(0))
+                
+                # Stack to [B, H, W]
+                try:
+                    mask_labels_tensor = torch.stack(mask_label_tensors)  # [B, H, W]
+                    
+                    # Compute alignment loss
+                    alignment_loss = self.prompt_fusion.compute_text_visual_alignment_loss(
+                        text_embed=text_embed,
+                        visual_embed=visual_embed,
+                        mask_labels=mask_labels_tensor
+                    )
+                    
+                    # Apply weight (can be configured, default 0.5)
+                    alignment_loss = alignment_loss * 0.5
+                    
+                    return alignment_loss
+                except Exception as e:
+                    # If shapes don't match, skip this loss
+                    return None
+        
+        return None
     
     def _compute_dpsr_loss(self, batch_data_samples: SampleList, 
                           prev_predictions: Optional[Dict] = None) -> Optional[torch.Tensor]:

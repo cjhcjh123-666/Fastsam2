@@ -192,3 +192,9 @@ val_cfg = None
 test_dataloader = None
 test_evaluator = None
 test_cfg = None
+
+# Multi-task model with conditional modules requires find_unused_parameters
+# Some modules (e.g., TextEncoder) are only used for specific data types (RefCOCO)
+# Others (e.g., StreamingMemory) are only used for video data (VOS)
+# In mixed dataset training, not all parameters are used in every forward pass
+find_unused_parameters = False

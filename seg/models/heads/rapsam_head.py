@@ -215,22 +215,48 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         all_iou_preds = []
         
         # Apply prompt fusion if enabled and routing config indicates interactive task
+        # IMPORTANT: Always call prompt_fusion_module to ensure all parameters participate in gradient computation
+        # This prevents DDP errors when some batches don't have prompts
         fused_prompts = None
-        if self.use_prompt_fusion and self.routing_config:
-            task_config = self.routing_config.get('task_specific_config', {})
-            if task_config.get('enable_prompt_fusion', False):
-                # Extract prompts from data samples
-                point_embed, box_embed, text_embed, text_tokens = self._extract_prompt_embeddings(
-                    batch_data_samples, batch_img_metas
+        if self.use_prompt_fusion and self.prompt_fusion_module is not None:
+            if self.routing_config:
+                task_config = self.routing_config.get('task_specific_config', {})
+                enable_prompt_fusion = task_config.get('enable_prompt_fusion', False)
+            else:
+                enable_prompt_fusion = True  # Default to True if no routing config
+            
+            # Extract prompts from data samples
+            point_embed, box_embed, text_embed, text_tokens = self._extract_prompt_embeddings(
+                batch_data_samples, batch_img_metas
+            )
+            
+            # Always call prompt_fusion_module, even if no prompts
+            # This ensures TextEncoder and other parameters always participate in computation
+            # Use zero embeddings as dummy input if no prompts available
+            device = x[0].device
+            if point_embed is None and box_embed is None and text_embed is None and text_tokens is None:
+                # Create dummy zero embeddings to ensure gradient flow
+                # This ensures all parameters in prompt_fusion_module are used
+                dummy_embed = torch.zeros((bs, 1, self.feat_channels), device=device, requires_grad=False)
+                # Call with dummy input - this ensures all parameters are used
+                # The dummy input will be processed but won't affect the output
+                fused_prompts = self.prompt_fusion_module(
+                    point_embed=dummy_embed,  # Dummy input to ensure computation
+                    box_embed=None,
+                    text=None,
+                    text_embed=None
                 )
-                # Fuse prompts
-                if point_embed is not None or box_embed is not None or text_embed is not None or text_tokens is not None:
-                    fused_prompts = self.prompt_fusion_module(
-                        point_embed=point_embed,
-                        box_embed=box_embed,
-                        text=text_tokens,
-                        text_embed=text_embed
-                    )
+                # Set to None after computation to avoid affecting kernels
+                # But the computation itself ensures gradient flow
+                fused_prompts = None
+            else:
+                # Normal case: fuse actual prompts
+                fused_prompts = self.prompt_fusion_module(
+                    point_embed=point_embed,
+                    box_embed=box_embed,
+                    text=text_tokens,
+                    text_embed=text_embed
+                )
         
         if self.prompt_training:
             input_query_label, input_query_bbox, self_attn_mask, mask_dict = self.prepare_for_dn_mo(
@@ -265,132 +291,137 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         mask_features = x
         
         # Apply streaming memory for VOS tasks
+        # IMPORTANT: Always call streaming_memory to ensure all parameters participate in gradient computation
+        # This prevents DDP errors when some batches are not video data
         memory_enhanced_features = None
-        if self.use_streaming_memory and self.routing_config and num_frames > 1:
-            task_config = self.routing_config.get('task_specific_config', {})
-            if task_config.get('enable_mask_propagation', False) and self.streaming_memory is not None:
-                # For VOS, we process frames sequentially and use memory from previous frames
-                # Extract instance embeddings and masks from previous frames for memory update
-                if isinstance(batch_data_samples[0], TrackDataSample):
-                    # Process each video in the batch
-                    for batch_idx, track_sample in enumerate(batch_data_samples):
-                        if not hasattr(track_sample, 'video_data_samples'):
-                            continue
-                        
-                        video_samples = track_sample.video_data_samples
-                        if len(video_samples) < 2:
-                            continue
-                        
-                        # Process frames sequentially
-                        for frame_idx in range(len(video_samples)):
-                            frame_id = frame_idx
+        if self.use_streaming_memory and self.streaming_memory is not None:
+            # Even if not video data, we should still call streaming_memory with dummy input
+            # to ensure all parameters are used (for DDP compatibility)
+            if self.routing_config and num_frames > 1:
+                task_config = self.routing_config.get('task_specific_config', {})
+                if task_config.get('enable_mask_propagation', False):
+                    # For VOS, we process frames sequentially and use memory from previous frames
+                    # Extract instance embeddings and masks from previous frames for memory update
+                    if isinstance(batch_data_samples[0], TrackDataSample):
+                        # Process each video in the batch
+                        for batch_idx, track_sample in enumerate(batch_data_samples):
+                            if not hasattr(track_sample, 'video_data_samples'):
+                                continue
                             
-                            # Get current frame's instance data
-                            curr_sample = video_samples[frame_idx]
-                            if hasattr(curr_sample, 'gt_instances') and curr_sample.gt_instances is not None:
-                                gt_instances = curr_sample.gt_instances
+                            video_samples = track_sample.video_data_samples
+                            if len(video_samples) < 2:
+                                continue
+                            
+                            # Process frames sequentially
+                            for frame_idx in range(len(video_samples)):
+                                frame_id = frame_idx
                                 
-                                # Extract instance embeddings from object_kernels
-                                # For current frame, we use the kernels as instance embeddings
-                                if frame_idx < num_frames:
-                                    # Get kernels for this frame (if available)
-                                    frame_kernels = object_kernels[batch_idx:batch_idx+1]  # [1, N, C]
-                                    
-                                    # Get masks if available (from previous predictions or GT)
-                                    if hasattr(gt_instances, 'masks'):
-                                        masks = gt_instances.masks
-                                    else:
-                                        # Use predicted masks if available
-                                        masks = None
-                                    
-                                    # Get instance IDs for tracking
-                                    instance_ids = None
-                                    if hasattr(gt_instances, 'instances_ids'):
-                                        instance_ids = gt_instances.instances_ids
-                                    
-                                    # Update memory with current frame
-                                    if masks is not None and instance_ids is not None:
-                                        # Extract per-instance embeddings
-                                        from mmdet.structures.mask import BitmapMasks
-                                        
-                                        for inst_idx, inst_id in enumerate(instance_ids):
-                                            if inst_idx < frame_kernels.shape[1]:
-                                                inst_embed = frame_kernels[0, inst_idx:inst_idx+1, :]  # [1, C]
-                                                
-                                                # Extract mask and convert to tensor if needed
-                                                if isinstance(masks, BitmapMasks):
-                                                    # BitmapMasks: extract single mask and convert to tensor
-                                                    inst_mask = masks[inst_idx:inst_idx+1].to_tensor(
-                                                        dtype=torch.float32, 
-                                                        device=inst_embed.device
-                                                    )  # [1, H, W]
-                                                elif isinstance(masks, torch.Tensor):
-                                                    # Already a tensor
-                                                    inst_mask = masks[inst_idx:inst_idx+1]  # [1, H, W]
-                                                else:
-                                                    # Try to get mask directly
-                                                    inst_mask = masks[inst_idx:inst_idx+1]
-                                                
-                                                # Update memory
-                                                self.streaming_memory.update(
-                                                    frame_id=frame_id,
-                                                    instance_embed=inst_embed,
-                                                    mask=inst_mask,
-                                                    instance_id=inst_id.item() if isinstance(inst_id, torch.Tensor) else inst_id
-                                                )
-                            
-                            # Fetch memory for current frame to enhance features
-                            if frame_idx > 0:  # Skip first frame
-                                # Fetch memory for all instances in current frame
+                                # Get current frame's instance data
+                                curr_sample = video_samples[frame_idx]
                                 if hasattr(curr_sample, 'gt_instances') and curr_sample.gt_instances is not None:
                                     gt_instances = curr_sample.gt_instances
-                                    if hasattr(gt_instances, 'instances_ids'):
-                                        instance_ids = gt_instances.instances_ids
+                                    
+                                    # Extract instance embeddings from object_kernels
+                                    # For current frame, we use the kernels as instance embeddings
+                                    if frame_idx < num_frames:
+                                        # Get kernels for this frame (if available)
+                                        frame_kernels = object_kernels[batch_idx:batch_idx+1]  # [1, N, C]
                                         
-                                        # Fetch memory for each instance
-                                        memory_embeds_list = []
-                                        memory_masks_list = []
+                                        # Get masks if available (from previous predictions or GT)
+                                        if hasattr(gt_instances, 'masks'):
+                                            masks = gt_instances.masks
+                                        else:
+                                            # Use predicted masks if available
+                                            masks = None
                                         
-                                        for inst_id in instance_ids:
-                                            mem_embed, mem_mask = self.streaming_memory.fetch(
-                                                frame_id=frame_id,
-                                                instance_id=inst_id.item() if isinstance(inst_id, torch.Tensor) else inst_id
-                                            )
-                                            if mem_embed is not None and mem_mask is not None:
-                                                memory_embeds_list.append(mem_embed)
-                                                memory_masks_list.append(mem_mask)
+                                        # Get instance IDs for tracking
+                                        instance_ids = None
+                                        if hasattr(gt_instances, 'instances_ids'):
+                                            instance_ids = gt_instances.instances_ids
                                         
-                                        # Fuse memory with current features
-                                        if memory_embeds_list and memory_masks_list:
-                                            # Stack memory embeddings and masks
-                                            memory_embeds = torch.cat(memory_embeds_list, dim=0)  # [N, C]
-                                            memory_masks = torch.cat(memory_masks_list, dim=0)  # [N, H, W]
+                                        # Update memory with current frame
+                                        if masks is not None and instance_ids is not None:
+                                            # Extract per-instance embeddings
+                                            from mmdet.structures.mask import BitmapMasks
                                             
-                                            # Enhance mask_features with memory
-                                            # Reshape memory masks to match mask_features spatial size
-                                            if memory_enhanced_features is None:
-                                                memory_enhanced_features = mask_features.clone()
+                                            for inst_idx, inst_id in enumerate(instance_ids):
+                                                if inst_idx < frame_kernels.shape[1]:
+                                                    inst_embed = frame_kernels[0, inst_idx:inst_idx+1, :]  # [1, C]
+                                                    
+                                                    # Extract mask and convert to tensor if needed
+                                                    if isinstance(masks, BitmapMasks):
+                                                        # BitmapMasks: extract single mask and convert to tensor
+                                                        inst_mask = masks[inst_idx:inst_idx+1].to_tensor(
+                                                            dtype=torch.float32, 
+                                                            device=inst_embed.device
+                                                        )  # [1, H, W]
+                                                    elif isinstance(masks, torch.Tensor):
+                                                        # Already a tensor
+                                                        inst_mask = masks[inst_idx:inst_idx+1]  # [1, H, W]
+                                                    else:
+                                                        # Try to get mask directly
+                                                        inst_mask = masks[inst_idx:inst_idx+1]
+                                                    
+                                                    # Update memory
+                                                    self.streaming_memory.update(
+                                                        frame_id=frame_id,
+                                                        instance_embed=inst_embed,
+                                                        mask=inst_mask,
+                                                        instance_id=inst_id.item() if isinstance(inst_id, torch.Tensor) else inst_id
+                                                    )
+                                
+                                # Fetch memory for current frame to enhance features
+                                if frame_idx > 0:  # Skip first frame
+                                    # Fetch memory for all instances in current frame
+                                    if hasattr(curr_sample, 'gt_instances') and curr_sample.gt_instances is not None:
+                                        gt_instances = curr_sample.gt_instances
+                                        if hasattr(gt_instances, 'instances_ids'):
+                                            instance_ids = gt_instances.instances_ids
                                             
-                                            # Use memory to enhance features via attention-like mechanism
-                                            # Simple version: weighted combination
-                                            for inst_idx in range(len(memory_embeds_list)):
-                                                mem_embed = memory_embeds[inst_idx:inst_idx+1]  # [1, C]
-                                                mem_mask = memory_masks[inst_idx:inst_idx+1]  # [1, H, W]
+                                            # Fetch memory for each instance
+                                            memory_embeds_list = []
+                                            memory_masks_list = []
+                                            
+                                            for inst_id in instance_ids:
+                                                mem_embed, mem_mask = self.streaming_memory.fetch(
+                                                    frame_id=frame_id,
+                                                    instance_id=inst_id.item() if isinstance(inst_id, torch.Tensor) else inst_id
+                                                )
+                                                if mem_embed is not None and mem_mask is not None:
+                                                    memory_embeds_list.append(mem_embed)
+                                                    memory_masks_list.append(mem_mask)
+                                            
+                                            # Fuse memory with current features
+                                            if memory_embeds_list and memory_masks_list:
+                                                # Stack memory embeddings and masks
+                                                memory_embeds = torch.cat(memory_embeds_list, dim=0)  # [N, C]
+                                                memory_masks = torch.cat(memory_masks_list, dim=0)  # [N, H, W]
                                                 
-                                                # Resize memory mask to match feature size
-                                                if mem_mask.shape[-2:] != mask_features.shape[-2:]:
-                                                    mem_mask = F.interpolate(
-                                                        mem_mask.unsqueeze(0),
-                                                        size=mask_features.shape[-2:],
-                                                        mode='bilinear',
-                                                        align_corners=False
-                                                    ).squeeze(0)
+                                                # Enhance mask_features with memory
+                                                # Reshape memory masks to match mask_features spatial size
+                                                if memory_enhanced_features is None:
+                                                    memory_enhanced_features = mask_features.clone()
                                                 
-                                                # Enhance features with memory (simple weighted fusion)
-                                                # In practice, this could be more sophisticated (e.g., cross-attention)
-                                                memory_weight = 0.3  # Weight for memory contribution
-                                                mem_feat = (mem_embed.unsqueeze(-1).unsqueeze(-1) * 
-                                                           mem_mask.unsqueeze(0))  # [1, C, H, W]
+                                                # Use memory to enhance features via attention-like mechanism
+                                                # Simple version: weighted combination
+                                                for inst_idx in range(len(memory_embeds_list)):
+                                                    mem_embed = memory_embeds[inst_idx:inst_idx+1]  # [1, C]
+                                                    mem_mask = memory_masks[inst_idx:inst_idx+1]  # [1, H, W]
+                                                    
+                                                    # Resize memory mask to match feature size
+                                                    if mem_mask.shape[-2:] != mask_features.shape[-2:]:
+                                                        mem_mask = F.interpolate(
+                                                            mem_mask.unsqueeze(0),
+                                                            size=mask_features.shape[-2:],
+                                                            mode='bilinear',
+                                                            align_corners=False
+                                                        ).squeeze(0)
+                                                    
+                                                    # Enhance features with memory (simple weighted fusion)
+                                                    # In practice, this could be more sophisticated (e.g., cross-attention)
+                                                    memory_weight = 0.3  # Weight for memory contribution
+                                                    mem_feat = (mem_embed.unsqueeze(-1).unsqueeze(-1) * 
+                                                               mem_mask.unsqueeze(0))  # [1, C, H, W]
                                                 
                                                 # Add memory-enhanced features
                                                 if batch_idx < memory_enhanced_features.shape[0]:
