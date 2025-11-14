@@ -94,10 +94,20 @@ class TaskRouter(nn.Module):
             ])
         
         # Check if gt_instances_collected exists (interactive training)
-        has_gt_collected = any(
-            hasattr(ds, 'gt_instances_collected') and ds.gt_instances_collected is not None
-            for ds in data_samples
-        )
+        has_gt_collected = False
+        for ds in data_samples:
+            # Check regular DetDataSample
+            if hasattr(ds, 'gt_instances_collected') and ds.gt_instances_collected is not None:
+                has_gt_collected = True
+                break
+            # Check TrackDataSample's video frames
+            if hasattr(ds, 'video_data_samples') and ds.video_data_samples:
+                for frame in ds.video_data_samples:
+                    if hasattr(frame, 'gt_instances_collected') and frame.gt_instances_collected is not None:
+                        has_gt_collected = True
+                        break
+                if has_gt_collected:
+                    break
         
         # Check if it's VOS (has instance IDs in video)
         is_vos = False

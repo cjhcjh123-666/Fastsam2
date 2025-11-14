@@ -303,13 +303,41 @@ class Mask2FormerVideoHead(AnchorFreeHead):
                 gt_semantic_segs = [None] * len(batch_gt_instances)
             else:
                 gt_semantic_segs = [torch.stack(gt_sem_seg, dim=0) for gt_sem_seg in gt_semantic_segs]
-            gt_instance_ids_list = [
-                [torch.stack([torch.ones_like(gt_instances['instances_ids']) * frame_id, gt_instances['instances_ids']],
-                             dim=1)
-                 for frame_id, gt_instances in enumerate(gt_vid_instances)]
+            # 检查是否有instances_ids（VOS任务）
+            has_instances_ids = any(
+                hasattr(gt_vid_instances[0], 'instances_ids') if gt_vid_instances else False
                 for gt_vid_instances in batch_gt_instances
-            ]
-            gt_instance_ids_list = [torch.cat(gt_instance_ids, dim=0) for gt_instance_ids in gt_instance_ids_list]
+            )
+            
+            if has_instances_ids:
+                # VOS任务：使用instances_ids
+                gt_instance_ids_list = [
+                    [torch.stack([torch.ones_like(gt_instances['instances_ids']) * frame_id, gt_instances['instances_ids']],
+                                 dim=1)
+                     for frame_id, gt_instances in enumerate(gt_vid_instances)]
+                    for gt_vid_instances in batch_gt_instances
+                ]
+                gt_instance_ids_list = [torch.cat(gt_instance_ids, dim=0) for gt_instance_ids in gt_instance_ids_list]
+            else:
+                # 交互视频任务：生成临时的instances_ids
+                gt_instance_ids_list = []
+                for gt_vid_instances in batch_gt_instances:
+                    frame_ids_list = []
+                    for frame_id, gt_instances in enumerate(gt_vid_instances):
+                        num_instances = len(gt_instances.labels) if hasattr(gt_instances, 'labels') else 0
+                        if num_instances > 0:
+                            # 创建临时ID: [frame_id, instance_id]
+                            instance_ids = torch.arange(num_instances, device=gt_instances.labels.device)
+                            frame_ids = torch.stack([
+                                torch.ones_like(instance_ids) * frame_id,
+                                instance_ids
+                            ], dim=1)
+                            frame_ids_list.append(frame_ids)
+                    if frame_ids_list:
+                        gt_instance_ids_list.append(torch.cat(frame_ids_list, dim=0))
+                    else:
+                        # 空的情况，创建一个空tensor
+                        gt_instance_ids_list.append(torch.empty((0, 2), dtype=torch.long, device='cuda'))
             targets = multi_apply(preprocess_video_panoptic_gt, gt_labels_list,
                                   gt_masks_list, gt_semantic_segs, gt_instance_ids_list,
                                   num_things_list, num_stuff_list)
@@ -648,7 +676,10 @@ class Mask2FormerVideoHead(AnchorFreeHead):
                 # zero match
                 loss_dice = mask_preds.sum()
                 loss_mask = mask_preds.sum()
-                loss_iou = iou_preds.sum() * 0.0
+                if iou_preds is not None:
+                    loss_iou = iou_preds.sum() * 0.0
+                else:
+                    loss_iou = mask_preds.new_tensor(0.0, requires_grad=True)
                 loss_iou += (self.mask_tokens.weight.sum() + self.pb_embedding.weight.sum()) * 0.0
                 loss_iou += (self.pos_linear.weight.sum() + self.pos_linear.bias.sum()) * 0.0
                 if self.use_adaptor:
@@ -685,7 +716,10 @@ class Mask2FormerVideoHead(AnchorFreeHead):
                 mask_point_targets,
                 avg_factor=num_total_masks * self.num_points
             )
-            loss_iou = iou_preds.sum() * 0.0
+            
+            # VOS和全景分割不需要IoU预测loss（使用cls_score表示置信度）
+            # 创建零loss但保持梯度流，避免DDP错误
+            loss_iou = iou_preds.sum() * 0.0 if iou_preds is not None else mask_preds.new_tensor(0.0, requires_grad=True)
             loss_iou += (self.mask_tokens.weight.sum() + self.pb_embedding.weight.sum()) * 0.0
             loss_iou += (self.pos_linear.weight.sum() + self.pos_linear.bias.sum()) * 0.0
             if self.use_adaptor:
@@ -695,6 +729,7 @@ class Mask2FormerVideoHead(AnchorFreeHead):
                     loss_iou += p.sum() * 0.0
                 for n,p in self.prompt_iou.named_parameters():
                     loss_iou += p.sum() * 0.0
+            
             return loss_cls, loss_mask, loss_dice, loss_iou
 
     def forward_logit(self, cls_embd):
@@ -1074,16 +1109,33 @@ class Mask2FormerVideoHead(AnchorFreeHead):
         pb_labels = torch.stack(pb_labels_list)
         labels = torch.zeros_like(pb_labels).long()
 
-        boxes = point_coords  # + boxes
+        # 处理boxes：检查是否有真正的box坐标，如果没有则从点坐标创建
+        # 点坐标是(x, y)，需要转换为box格式(x1, y1, x2, y2)
+        has_boxes = any(hasattr(inst, 'bboxes') for inst in gt_instances)
+        if has_boxes:
+            # 使用实际的box坐标
+            boxes = torch.stack([inst.bboxes if hasattr(inst, 'bboxes') else 
+                                torch.cat([inst.point_coords, inst.point_coords], dim=-1) 
+                                for inst in gt_instances])
+        else:
+            # 只有点坐标，将点扩展为小的box区域
+            # 点(x, y) -> box(x-r, y-r, x+r, y+r)，r是一个小的半径
+            radius = 5.0  # 像素半径
+            boxes = torch.cat([
+                point_coords - radius,  # x1, y1
+                point_coords + radius   # x2, y2
+            ], dim=-1)
 
         factors = []
         for i, data_sample in enumerate(batch_data_samples):
             h, w, = data_sample.metainfo['img_shape']
+            # Box coordinates: (x1, y1, x2, y2)
             factor = boxes[i].new_tensor([w, h, w, h]).unsqueeze(0).repeat(boxes[i].size(0), 1)
             factors.append(factor)
         factors = torch.stack(factors, 0)
 
-        boxes = bbox_xyxy_to_cxcywh(boxes / factors)  # xyxy / factor or xywh / factor ????
+        # 归一化并转换为 cxcywh 格式
+        boxes = bbox_xyxy_to_cxcywh(boxes / factors)
         # box_start = [t['box_start'] for t in targets]
         box_start = [len(point) for point in point_coords]
 
@@ -1097,12 +1149,14 @@ class Mask2FormerVideoHead(AnchorFreeHead):
 
         if noise_scale > 0 and self.training:
             diff = torch.zeros_like(known_bbox_expand)
+            # Box coordinates: 4维 (cx, cy, w, h)
             diff[:, :, :2] = known_bbox_expand[:, :, 2:] / 2
             diff[:, :, 2:] = known_bbox_expand[:, :, 2:]
             # add very small noise to input points; no box
             sc = 0.01
             for i, st in enumerate(box_start):
                 diff[i, :st] = diff[i, :st] * sc
+            
             known_bbox_expand += torch.mul(
                 (torch.rand_like(known_bbox_expand) * 2 - 1.0),
                 diff) * noise_scale

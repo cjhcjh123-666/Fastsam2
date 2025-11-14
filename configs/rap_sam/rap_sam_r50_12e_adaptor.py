@@ -57,38 +57,53 @@ task_router = dict(
 )
 
 # Task-specific loss weights configuration
-# 当batch属于某个任务时，只有对应的loss生效，其他任务的loss权重为0
-# 这样可以避免不同任务之间的loss冲突，同时保证所有模块都参与梯度计算
+# 
+# 设计理念：
+# 1. 基础Loss（所有任务共享）：loss_cls, loss_mask, loss_dice, loss_iou
+#    这些是所有分割任务的核心，在所有任务中都保持正权重
+# 
+# 2. 任务特定Loss（按需激活/屏蔽）：
+#    - loss_prompt_align: 交互任务专属
+#    - loss_text_visual: 文本提示任务专属
+#    - loss_dpsr: VOS任务专属
+#    - loss_temporal: 视频任务专属
+#    - loss_memory_align: VOS任务专属
+#    - loss_panoptic: 全景分割专属
+# 
+# 3. 当batch属于某个任务时，基础loss保持激活，只屏蔽其他任务的特定loss
+#    这样既避免了任务间loss冲突，又保证了所有模块参与梯度计算（DDP要求）
 task_loss_weights = dict(
     # 图像交互分割（点、框、文本提示）
     interactive_image=dict(
-        # 基础loss（共享）
-        loss_cls=1.0,      # 分类loss
+        # 基础loss
+        loss_cls=0.0,      # 交互任务不需要分类（用户已通过prompt指定目标）
         loss_mask=5.0,     # mask loss
         loss_dice=5.0,     # dice loss
-        loss_iou=10.0,     # IoU预测loss
-        # 任务特定loss
+        loss_iou=10.0,     # IoU预测loss（预测mask质量）
+        # 任务特定loss（激活）
         loss_prompt_align=0.5,    # prompt对齐loss
-        loss_text_visual=0.3,     # 文本-视觉对齐loss（仅文本提示时）
+        loss_text_visual=0.3,     # 文本-视觉对齐loss
         # 屏蔽其他任务的loss
         loss_dpsr=0.0,            # VOS的DPSR loss
         loss_temporal=0.0,        # 视频时序loss
+        loss_memory_align=0.0,    # 记忆对齐loss
         loss_panoptic=0.0,        # 全景分割loss
     ),
     
     # 视频交互分割（点、框、文本提示 + 视频）
     interactive_video=dict(
         # 基础loss
-        loss_cls=1.0,
+        loss_cls=0.0,      # 交互任务不需要分类（用户已通过prompt指定目标）
         loss_mask=5.0,
         loss_dice=5.0,
-        loss_iou=10.0,
-        # 任务特定loss
+        loss_iou=10.0,     # IoU预测loss（预测mask质量）
+        # 任务特定loss（激活）
         loss_prompt_align=0.5,
         loss_text_visual=0.3,
         loss_temporal=1.0,        # 时序一致性loss
         # 屏蔽其他任务的loss
         loss_dpsr=0.0,
+        loss_memory_align=0.0,
         loss_panoptic=0.0,
     ),
     
@@ -98,8 +113,8 @@ task_loss_weights = dict(
         loss_cls=1.0,
         loss_mask=5.0,
         loss_dice=5.0,
-        loss_iou=0.0,             # VOS不需要IoU预测
-        # 任务特定loss
+        loss_iou=0.0,             # VOS不需要IoU预测（使用cls_score表示置信度）
+        # 任务特定loss（激活）
         loss_dpsr=2.0,            # 双路径自优化loss
         loss_temporal=1.5,        # 时序一致性loss
         loss_memory_align=1.0,    # 记忆对齐loss
@@ -115,8 +130,8 @@ task_loss_weights = dict(
         loss_cls=2.0,             # 全景分割需要更强的分类约束
         loss_mask=5.0,
         loss_dice=5.0,
-        loss_iou=0.0,
-        # 任务特定loss
+        loss_iou=0.0,             # 全景分割不需要IoU预测（使用cls_score表示置信度）
+        # 任务特定loss（激活）
         loss_panoptic=1.0,        # 全景分割特定loss
         # 屏蔽其他任务的loss
         loss_prompt_align=0.0,

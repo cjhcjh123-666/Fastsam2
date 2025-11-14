@@ -66,16 +66,21 @@ def create_dummy_batch(task_type='interactive_image', batch_size=2, num_frames=1
         if task_type in ['interactive_image', 'interactive_video']:
             # 交互任务：添加prompt
             gt_instances_collected = InstanceData()
-            # 添加点击坐标
+            # 添加点击坐标 - 修正：应该是 (num_instances, 2) 维度，prepare_for_dn_mo 会 stack 成 (B, N, 2)
             point_coords = torch.rand(num_instances, 2).cuda() * 512
             gt_instances_collected.point_coords = point_coords
-            # 添加点击标签 (1=前景, 0=背景)
+            # 添加点击标签 (1=前景, 0=背景) - (num_instances,)
             gt_instances_collected.pb_labels = torch.ones(num_instances, dtype=torch.long).cuda()
             data_sample.gt_instances_collected = gt_instances_collected
             
-            # 如果是文本提示，添加文本
-            if i == 0:  # 只在第一个样本添加文本，测试混合情况
-                data_sample.set_metainfo({'text': 'a person wearing red shirt'})
+            # 🔥 关键：给所有交互样本都添加文本提示，确保loss_text_visual能激活
+            # 不同样本使用不同的text，模拟真实场景
+            text_prompts = [
+                'a person wearing red shirt',
+                'a dog running in the park',
+                'a car on the street',
+            ]
+            data_sample.set_metainfo({'text': text_prompts[i % len(text_prompts)]})
         
         elif task_type == 'vos':
             # VOS任务：添加实例ID用于跟踪
@@ -96,6 +101,11 @@ def create_dummy_batch(task_type='interactive_image', batch_size=2, num_frames=1
             track_sample = TrackDataSample()
             # 创建多帧数据
             video_data_samples = []
+            
+            # 对于VOS任务，所有帧的labels必须一致
+            # 提前生成固定的labels
+            fixed_labels = torch.randint(0, 80, (num_instances,)).cuda()
+            
             for t in range(num_frames):
                 # 为每一帧创建独立的数据样本
                 frame_sample = DetDataSample()
@@ -111,22 +121,34 @@ def create_dummy_batch(task_type='interactive_image', batch_size=2, num_frames=1
                 frame_instances = InstanceData()
                 masks_np = np.random.randint(0, 2, (num_instances, 512, 512), dtype=np.uint8)
                 frame_instances.masks = BitmapMasks(masks_np, height=512, width=512)
-                frame_instances.labels = torch.randint(0, 80, (num_instances,)).cuda()
+                
+                # 使用固定的labels（VOS要求所有帧labels一致）
+                frame_instances.labels = fixed_labels.clone()
+                
                 bboxes = torch.rand(num_instances, 4).cuda() * 512
                 bboxes[:, 2:] = bboxes[:, 2:] + bboxes[:, :2]
                 frame_instances.bboxes = bboxes
                 
-                # VOS任务：添加实例ID
+                # 只有VOS任务需要实例ID
                 if task_type == 'vos':
                     frame_instances.instances_ids = torch.arange(num_instances).cuda()
                 
                 # 交互视频任务：添加prompt（仅第一帧）
                 if task_type == 'interactive_video' and t == 0:
                     gt_instances_collected = InstanceData()
+                    # 修正维度：(num_instances, 2)
                     point_coords = torch.rand(num_instances, 2).cuda() * 512
                     gt_instances_collected.point_coords = point_coords
+                    # 修正维度：(num_instances,)
                     gt_instances_collected.pb_labels = torch.ones(num_instances, dtype=torch.long).cuda()
                     frame_sample.gt_instances_collected = gt_instances_collected
+                    
+                    # 🔥 给所有视频交互样本都添加文本提示
+                    text_prompts = [
+                        'a person wearing red shirt',
+                        'a dog running in the park',
+                    ]
+                    frame_sample.set_metainfo({'text': text_prompts[i % len(text_prompts)]})
                 
                 frame_sample.gt_instances = frame_instances
                 video_data_samples.append(frame_sample)
@@ -259,22 +281,61 @@ def test_forward_pass(config_path='/mnt/chenjiahui/Fastsam2-main/configs/rap_sam
             print(f"   屏蔽的Loss ({len(masked_losses)}个): {', '.join(masked_losses)}")
             
             # 验证loss masking是否正确
-            expected_active = {
-                'interactive_image': ['loss_cls', 'loss_mask', 'loss_dice', 'loss_iou', 'loss_prompt_align'],
-                'interactive_video': ['loss_cls', 'loss_mask', 'loss_dice', 'loss_iou', 'loss_prompt_align', 'loss_temporal'],
+            # 提取基础loss名称（去掉decoder层前缀）
+            def get_base_loss_name(loss_name):
+                return loss_name.split('.')[-1] if '.' in loss_name else loss_name
+            
+            # 定义每个任务应该激活的loss（基础loss + 任务特定loss）
+            expected_active_base = {
+                'interactive_image': ['loss_mask', 'loss_dice', 'loss_iou', 'loss_prompt_align', 'loss_text_visual'],
+                'interactive_video': ['loss_mask', 'loss_dice', 'loss_iou', 'loss_prompt_align', 'loss_text_visual', 'loss_temporal'],
                 'vos': ['loss_cls', 'loss_mask', 'loss_dice', 'loss_dpsr', 'loss_temporal', 'loss_memory_align'],
                 'panoptic': ['loss_cls', 'loss_mask', 'loss_dice', 'loss_panoptic'],
             }
             
-            # 检查是否有应该激活但未激活的loss
-            expected = expected_active.get(task_type, [])
-            missing_active = [l for l in expected if l not in active_losses and l in losses]
-            unexpected_active = [l for l in active_losses if l not in expected and not l.startswith('loss_dummy')]
+            # 定义每个任务应该屏蔽的loss
+            expected_masked_base = {
+                'interactive_image': ['loss_cls', 'loss_dpsr', 'loss_temporal', 'loss_memory_align', 'loss_panoptic'],
+                'interactive_video': ['loss_cls', 'loss_dpsr', 'loss_memory_align', 'loss_panoptic'],
+                'vos': ['loss_iou', 'loss_prompt_align', 'loss_text_visual', 'loss_panoptic'],
+                'panoptic': ['loss_iou', 'loss_dpsr', 'loss_temporal', 'loss_prompt_align', 'loss_text_visual', 'loss_memory_align'],
+            }
             
+            # 检查是否有应该激活但未激活的loss
+            expected_active = expected_active_base.get(task_type, [])
+            expected_masked = expected_masked_base.get(task_type, [])
+            active_base_losses = [get_base_loss_name(l) for l in active_losses]
+            masked_base_losses = [get_base_loss_name(l) for l in masked_losses]
+            
+            # 去重（因为d0/d1/d2会重复）
+            active_base_losses_unique = list(set(active_base_losses))
+            masked_base_losses_unique = list(set(masked_base_losses))
+            
+            # 检查缺失的激活loss
+            missing_active = [l for l in expected_active if l not in active_base_losses_unique]
+            # 检查不应该激活的loss
+            unexpected_active = [l for l in expected_masked if l in active_base_losses_unique]
+            # 检查应该屏蔽但未屏蔽的loss
+            missing_masked = [l for l in expected_masked if l not in masked_base_losses_unique and l not in active_base_losses_unique]
+            # 检查不应该屏蔽的loss
+            unexpected_masked = [l for l in expected_active if l in masked_base_losses_unique]
+            
+            # 打印详细的验证结果
+            validation_passed = True
             if missing_active:
-                print(f"\n   ⚠ 警告: 以下loss应该激活但未激活: {missing_active}")
+                print(f"\n   ❌ 错误: 以下loss应该激活但未激活: {missing_active}")
+                validation_passed = False
             if unexpected_active:
-                print(f"   ⚠ 警告: 以下loss意外激活: {unexpected_active}")
+                print(f"   ❌ 错误: 以下loss不应该激活但被激活: {unexpected_active}")
+                validation_passed = False
+            if unexpected_masked:
+                print(f"   ❌ 错误: 以下loss不应该屏蔽但被屏蔽: {unexpected_masked}")
+                validation_passed = False
+            
+            if validation_passed:
+                print(f"\n   ✅ Loss验证通过: 所有loss的激活/屏蔽状态正确")
+            else:
+                all_passed = False
             
             # 测试反向传播
             total_loss = sum(losses.values())
