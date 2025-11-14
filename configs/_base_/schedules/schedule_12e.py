@@ -49,7 +49,7 @@ optim_wrapper = dict(
         },
         norm_decay_mult=0.0
     ),
-    clip_grad=dict(max_norm=0.01, norm_type=2)
+    clip_grad=dict(max_norm=1.0, norm_type=2)  # 增大梯度裁剪阈值，避免过度裁剪
 )
 
 # Default setting for scaling LR automatically

@@ -19,6 +19,19 @@ def preprocess_video_panoptic_gt(
             mask_size, pad_val=0).to_tensor(
             dtype=torch.bool, device=gt_labels.device)
         )
+    
+    # 如果没有提供 instances_ids（非 VOS 任务），为每个帧的每个实例生成临时 ID
+    if gt_instance_ids is None:
+        # 为每个帧的每个实例生成 [frame_id, instance_id_in_frame] 格式的 ID
+        gt_instance_ids_list = []
+        for frame_id in range(num_frames):
+            num_instances_in_frame = thing_masks_list[frame_id].shape[0]
+            frame_ids = torch.full((num_instances_in_frame, 1), frame_id, dtype=torch.long, device=gt_labels.device)
+            instance_ids = torch.arange(num_instances_in_frame, dtype=torch.long, device=gt_labels.device).unsqueeze(1)
+            frame_instance_ids = torch.cat([frame_ids, instance_ids], dim=1)
+            gt_instance_ids_list.append(frame_instance_ids)
+        gt_instance_ids = torch.cat(gt_instance_ids_list, dim=0)
+    
     instances = torch.unique(gt_instance_ids[:, 1])
     things_masks = []
     labels = []

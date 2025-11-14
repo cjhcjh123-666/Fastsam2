@@ -303,13 +303,41 @@ class Mask2FormerVideoHead(AnchorFreeHead):
                 gt_semantic_segs = [None] * len(batch_gt_instances)
             else:
                 gt_semantic_segs = [torch.stack(gt_sem_seg, dim=0) for gt_sem_seg in gt_semantic_segs]
-            gt_instance_ids_list = [
-                [torch.stack([torch.ones_like(gt_instances['instances_ids']) * frame_id, gt_instances['instances_ids']],
-                             dim=1)
-                 for frame_id, gt_instances in enumerate(gt_vid_instances)]
+            # 检查是否有instances_ids（VOS任务）
+            has_instances_ids = any(
+                hasattr(gt_vid_instances[0], 'instances_ids') if gt_vid_instances else False
                 for gt_vid_instances in batch_gt_instances
-            ]
-            gt_instance_ids_list = [torch.cat(gt_instance_ids, dim=0) for gt_instance_ids in gt_instance_ids_list]
+            )
+            
+            if has_instances_ids:
+                # VOS任务：使用instances_ids
+                gt_instance_ids_list = [
+                    [torch.stack([torch.ones_like(gt_instances['instances_ids']) * frame_id, gt_instances['instances_ids']],
+                                 dim=1)
+                     for frame_id, gt_instances in enumerate(gt_vid_instances)]
+                    for gt_vid_instances in batch_gt_instances
+                ]
+                gt_instance_ids_list = [torch.cat(gt_instance_ids, dim=0) for gt_instance_ids in gt_instance_ids_list]
+            else:
+                # 交互视频任务：生成临时的instances_ids
+                gt_instance_ids_list = []
+                for gt_vid_instances in batch_gt_instances:
+                    frame_ids_list = []
+                    for frame_id, gt_instances in enumerate(gt_vid_instances):
+                        num_instances = len(gt_instances.labels) if hasattr(gt_instances, 'labels') else 0
+                        if num_instances > 0:
+                            # 创建临时ID: [frame_id, instance_id]
+                            instance_ids = torch.arange(num_instances, device=gt_instances.labels.device)
+                            frame_ids = torch.stack([
+                                torch.ones_like(instance_ids) * frame_id,
+                                instance_ids
+                            ], dim=1)
+                            frame_ids_list.append(frame_ids)
+                    if frame_ids_list:
+                        gt_instance_ids_list.append(torch.cat(frame_ids_list, dim=0))
+                    else:
+                        # 空的情况，创建一个空tensor
+                        gt_instance_ids_list.append(torch.empty((0, 2), dtype=torch.long, device='cuda'))
             targets = multi_apply(preprocess_video_panoptic_gt, gt_labels_list,
                                   gt_masks_list, gt_semantic_segs, gt_instance_ids_list,
                                   num_things_list, num_stuff_list)
@@ -437,7 +465,17 @@ class Mask2FormerVideoHead(AnchorFreeHead):
         mask_points_pred = point_sample(mask_pred.unsqueeze(1),
                                         point_coords.repeat(num_queries, 1, 1)).squeeze(1)
         # shape (num_gts, num_points)
-        gt_points_masks = point_sample(gt_masks.unsqueeze(1).float(),
+        # Ensure gt_masks is a tensor on the correct device
+        if hasattr(gt_masks, 'to_tensor'):
+            # BitmapMasks or PolygonMasks object
+            gt_masks_tensor = gt_masks.to_tensor(dtype=torch.float32, device=cls_score.device)
+        elif isinstance(gt_masks, torch.Tensor):
+            gt_masks_tensor = gt_masks.to(dtype=torch.float32, device=cls_score.device)
+        else:
+            # Fallback: try to convert
+            gt_masks_tensor = torch.tensor(gt_masks, dtype=torch.float32, device=cls_score.device)
+        
+        gt_points_masks = point_sample(gt_masks_tensor.unsqueeze(1),
                                         point_coords.repeat(num_gts, 1, 1)).squeeze(1)
 
         sampled_gt_instances = InstanceData(
@@ -574,19 +612,72 @@ class Mask2FormerVideoHead(AnchorFreeHead):
                                             points_coords).squeeze(1)
 
             # dice loss
-            loss_mask = self.loss_mask(mask_point_preds,
-                                    mask_point_targets,
-                                    reduction_override='none').mean(1)
-            loss_dice = self.loss_dice(mask_point_preds,
-                                    mask_point_targets,
-                                    reduction_override='none')
+            # 🔥 关键：使用avg_factor正确归一化，避免loss过大
+            # mask_point_preds形状: (num_masks, num_points)
+            # 需要除以 num_masks * num_points 来正确归一化
+            loss_mask = self.loss_mask(
+                mask_point_preds,
+                mask_point_targets,
+                reduction_override='none'
+            )  # (num_masks, num_points)
+            loss_dice = self.loss_dice(
+                mask_point_preds,
+                mask_point_targets,
+                reduction_override='none'
+            )  # (num_masks, num_points) 或 (num_masks,)
 
-            iou_preds = iou_preds.flatten()  # (bs, 60, 6) --> (bs, 360)
-            iou_target = 1 - (loss_dice / self.loss_dice.loss_weight)
-            loss_iou = F.mse_loss(iou_preds, iou_target, reduction="none")
-            loss_mask = loss_mask.sum() / num_total_masks
-            loss_dice = loss_dice.sum() / num_total_masks
-            loss_iou = loss_iou.sum() / num_total_masks * 10.0
+            # 处理iou_preds：确保形状正确
+            if iou_preds is not None:
+                # iou_preds的形状可能是 (bs, num_queries, 1) 或 (bs, num_queries, num_frames, 1)
+                # 需要flatten到 (bs * num_queries,) 或 (bs * num_queries * num_frames,)
+                if iou_preds.dim() > 2:
+                    # 如果是3D或4D，flatten所有维度除了batch
+                    iou_preds = iou_preds.flatten(1)  # (bs, num_queries, ...) -> (bs, num_queries * ...)
+                iou_preds = iou_preds.flatten()  # (bs, num_queries * ...) -> (bs * num_queries * ...)
+                
+                # 确保iou_preds和iou_target的形状匹配
+                # loss_dice需要先取平均（对num_points维度）
+                if loss_dice.dim() > 1:
+                    loss_dice_mean = loss_dice.mean(dim=1)  # (num_masks, num_points) -> (num_masks,)
+                else:
+                    loss_dice_mean = loss_dice  # (num_masks,)
+                
+                iou_target = 1 - (loss_dice_mean / self.loss_dice.loss_weight)
+                # 确保iou_preds和iou_target的形状匹配
+                if iou_preds.numel() != iou_target.numel():
+                    num_masks = mask_preds.shape[0]  # mask_preds已经通过mask_weights > 0过滤
+                    if iou_preds.numel() >= num_masks:
+                        iou_preds = iou_preds[:num_masks]
+                    else:
+                        device = iou_preds.device
+                        iou_preds = torch.cat([iou_preds, torch.zeros(num_masks - iou_preds.numel(), device=device)])
+                
+                loss_iou = F.mse_loss(iou_preds, iou_target, reduction="none")
+            else:
+                # 如果iou_preds是None，创建零loss但保持梯度流
+                device = mask_preds.device
+                loss_iou = torch.tensor(0.0, device=device, requires_grad=True)
+            
+            # 🔥 关键：正确归一化loss
+            # loss_mask形状: (num_masks, num_points)，需要除以 num_masks * num_points
+            # 或者先mean(1)再除以num_masks（等价）
+            if loss_mask.dim() > 1:
+                # (num_masks, num_points) -> 先对点维度取平均，再对mask维度求和并归一化
+                loss_mask = loss_mask.mean(dim=1).sum() / num_total_masks
+            else:
+                # (num_masks,) -> 直接求和并归一化
+                loss_mask = loss_mask.sum() / num_total_masks
+            
+            # loss_dice的处理
+            if loss_dice.dim() > 1:
+                # (num_masks, num_points) -> 先对点维度取平均，再对mask维度求和并归一化
+                loss_dice = loss_dice.mean(dim=1).sum() / num_total_masks
+            else:
+                # (num_masks,) -> 直接求和并归一化
+                loss_dice = loss_dice.sum() / num_total_masks
+            
+            # loss_iou的归一化（降低权重，避免过大）
+            loss_iou = loss_iou.sum() / num_total_masks * 1.0  # 降低权重，避免过大
 
             loss_cls = cls_scores.sum() * 0.0
             loss_cls += (self.query_embed.weight.sum() + self.query_feat.weight.sum()) * 0.0
@@ -638,7 +729,10 @@ class Mask2FormerVideoHead(AnchorFreeHead):
                 # zero match
                 loss_dice = mask_preds.sum()
                 loss_mask = mask_preds.sum()
-                loss_iou = iou_preds.sum() * 0.0
+                if iou_preds is not None:
+                    loss_iou = iou_preds.sum() * 0.0
+                else:
+                    loss_iou = mask_preds.new_tensor(0.0, requires_grad=True)
                 loss_iou += (self.mask_tokens.weight.sum() + self.pb_embedding.weight.sum()) * 0.0
                 loss_iou += (self.pos_linear.weight.sum() + self.pos_linear.bias.sum()) * 0.0
                 if self.use_adaptor:
@@ -675,7 +769,10 @@ class Mask2FormerVideoHead(AnchorFreeHead):
                 mask_point_targets,
                 avg_factor=num_total_masks * self.num_points
             )
-            loss_iou = iou_preds.sum() * 0.0
+            
+            # VOS和全景分割不需要IoU预测loss（使用cls_score表示置信度）
+            # 创建零loss但保持梯度流，避免DDP错误
+            loss_iou = iou_preds.sum() * 0.0 if iou_preds is not None else mask_preds.new_tensor(0.0, requires_grad=True)
             loss_iou += (self.mask_tokens.weight.sum() + self.pb_embedding.weight.sum()) * 0.0
             loss_iou += (self.pos_linear.weight.sum() + self.pos_linear.bias.sum()) * 0.0
             if self.use_adaptor:
@@ -685,6 +782,7 @@ class Mask2FormerVideoHead(AnchorFreeHead):
                     loss_iou += p.sum() * 0.0
                 for n,p in self.prompt_iou.named_parameters():
                     loss_iou += p.sum() * 0.0
+            
             return loss_cls, loss_mask, loss_dice, loss_iou
 
     def forward_logit(self, cls_embd):
@@ -933,20 +1031,201 @@ class Mask2FormerVideoHead(AnchorFreeHead):
         batch_gt_instances = []
         batch_gt_semantic_segs = []
 
-        if batch_data_samples[0].get('data_tag', 'coco') == 'sam':
-            self.prompt_training = True
-        else:
-            self.prompt_training = False
+        # 检查是否是交互任务（有gt_instances_collected）
+        # 交互任务包括：SAM (data_tag='sam')、RefCOCO (data_tag='refcoco')等
+        # 统一通过gt_instances_collected来判断
+        first_sample = batch_data_samples[0]
+        has_prompt = False
+        
+        if isinstance(first_sample, TrackDataSample):
+            # 视频交互任务：检查video_data_samples中的第一帧
+            if hasattr(first_sample, 'video_data_samples') and len(first_sample.video_data_samples) > 0:
+                first_frame = first_sample.video_data_samples[0]
+                if hasattr(first_frame, 'gt_instances_collected') and first_frame.gt_instances_collected is not None:
+                    has_prompt = True
+        elif hasattr(first_sample, 'gt_instances_collected') and first_sample.gt_instances_collected is not None:
+            # 图像交互任务 (SAM, RefCOCO等)
+            has_prompt = True
+        
+        self.prompt_training = has_prompt
 
         if self.prompt_training:
             for data_sample in batch_data_samples:
-                device = data_sample.gt_instances.labels.device
-                ori_masks = data_sample.gt_instances.masks.to_tensor(torch.bool, device)
-                indices = data_sample.gt_instances_collected.idx
-                gt_masks = ori_masks[indices]
-                gt_instances = InstanceData(masks=gt_masks)
-                batch_img_metas.append(data_sample.metainfo)
-                batch_gt_instances.append(gt_instances)
+                if isinstance(data_sample, TrackDataSample):
+                    # 视频交互任务：处理TrackDataSample
+                    clip_meta = []
+                    clip_instances = []
+                    clip_sem_seg = []
+                    for det_sample in data_sample.video_data_samples:
+                        clip_meta.append(det_sample.metainfo)
+                        # 从gt_instances_collected中获取masks
+                        if hasattr(det_sample, 'gt_instances_collected') and det_sample.gt_instances_collected is not None:
+                            gt_collected = det_sample.gt_instances_collected
+                            
+                            # 检查是否有idx属性（用于索引原始masks）
+                            indices = None
+                            if hasattr(gt_collected, 'idx'):
+                                # 使用idx索引原始masks（保持BitmapMasks格式）
+                                from mmdet.structures.mask import BitmapMasks
+                                ori_masks = det_sample.gt_instances.masks
+                                indices = gt_collected.idx.cpu().numpy()
+                                if isinstance(ori_masks, BitmapMasks):
+                                    # 从BitmapMasks中选择
+                                    masks_np = ori_masks.masks[indices]
+                                    gt_masks = BitmapMasks(masks_np, ori_masks.height, ori_masks.width)
+                                else:
+                                    # 如果是Tensor，转换为BitmapMasks
+                                    masks_tensor = ori_masks[indices] if isinstance(ori_masks, torch.Tensor) else ori_masks.to_tensor()[indices]
+                                    masks_np = masks_tensor.cpu().numpy().astype(np.uint8)
+                                    gt_masks = BitmapMasks(masks_np, masks_tensor.shape[-2], masks_tensor.shape[-1])
+                            elif hasattr(gt_collected, 'masks'):
+                                # 直接使用gt_instances_collected中的masks（保持原格式）
+                                from mmdet.structures.mask import BitmapMasks
+                                if isinstance(gt_collected.masks, BitmapMasks):
+                                    gt_masks = gt_collected.masks
+                                elif isinstance(gt_collected.masks, torch.Tensor):
+                                    # 转换为BitmapMasks
+                                    masks_np = gt_collected.masks.cpu().numpy().astype(np.uint8)
+                                    gt_masks = BitmapMasks(masks_np, gt_collected.masks.shape[-2], gt_collected.masks.shape[-1])
+                                else:
+                                    gt_masks = gt_collected.masks
+                            else:
+                                # 如果没有masks，使用原始gt_instances的masks
+                                gt_masks = det_sample.gt_instances.masks
+                            
+                            gt_instances = InstanceData(masks=gt_masks)
+                            # 🔥 关键：根据提取的masks数量，相应地选择labels和bboxes
+                            num_selected_masks = len(gt_masks)
+                            if indices is not None:
+                                # 如果有idx，使用相同的索引选择labels和bboxes
+                                # 确定device：优先使用labels的device，如果没有则使用bboxes的device，最后使用masks的device
+                                device = None
+                                if hasattr(det_sample.gt_instances, 'labels') and det_sample.gt_instances.labels is not None:
+                                    device = det_sample.gt_instances.labels.device
+                                elif hasattr(det_sample.gt_instances, 'bboxes') and det_sample.gt_instances.bboxes is not None:
+                                    device = det_sample.gt_instances.bboxes.device
+                                else:
+                                    # 如果没有labels和bboxes，使用masks的device（BitmapMasks没有device，使用cuda）
+                                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                                
+                                indices_tensor = torch.from_numpy(indices).to(device)
+                                if hasattr(det_sample.gt_instances, 'labels') and det_sample.gt_instances.labels is not None:
+                                    gt_instances.labels = det_sample.gt_instances.labels[indices_tensor]
+                                if hasattr(det_sample.gt_instances, 'bboxes') and det_sample.gt_instances.bboxes is not None:
+                                    gt_instances.bboxes = det_sample.gt_instances.bboxes[indices_tensor]
+                            else:
+                                # 如果没有idx，根据masks数量截取或扩展labels和bboxes
+                                if hasattr(det_sample.gt_instances, 'labels') and det_sample.gt_instances.labels is not None:
+                                    num_ori_labels = len(det_sample.gt_instances.labels)
+                                    if num_ori_labels >= num_selected_masks:
+                                        gt_instances.labels = det_sample.gt_instances.labels[:num_selected_masks]
+                                    else:
+                                        # 如果原始labels数量不够，重复最后一个
+                                        last_label = det_sample.gt_instances.labels[-1:]
+                                        gt_instances.labels = torch.cat([det_sample.gt_instances.labels, last_label.repeat(num_selected_masks - num_ori_labels)])
+                                if hasattr(det_sample.gt_instances, 'bboxes') and det_sample.gt_instances.bboxes is not None:
+                                    num_ori_bboxes = len(det_sample.gt_instances.bboxes)
+                                    if num_ori_bboxes >= num_selected_masks:
+                                        gt_instances.bboxes = det_sample.gt_instances.bboxes[:num_selected_masks]
+                                    else:
+                                        # 如果原始bboxes数量不够，重复最后一个
+                                        last_bbox = det_sample.gt_instances.bboxes[-1:]
+                                        gt_instances.bboxes = torch.cat([det_sample.gt_instances.bboxes, last_bbox.repeat(num_selected_masks - num_ori_bboxes, 1)])
+                            clip_instances.append(gt_instances)
+                        else:
+                            # 没有gt_instances_collected，使用原始gt_instances
+                            clip_instances.append(det_sample.gt_instances)
+                        
+                        if 'gt_sem_seg' in det_sample:
+                            clip_sem_seg.append(det_sample.gt_sem_seg)
+                        else:
+                            clip_sem_seg.append(None)
+                    batch_img_metas.append(clip_meta)
+                    batch_gt_instances.append(clip_instances)
+                    batch_gt_semantic_segs.append(clip_sem_seg)
+                else:
+                    # 图像交互任务：处理DetDataSample
+                    gt_collected = data_sample.gt_instances_collected
+                    
+                    # 检查是否有idx属性（用于索引原始masks）
+                    indices = None
+                    if hasattr(gt_collected, 'idx'):
+                        # 使用idx索引原始masks（保持BitmapMasks格式）
+                        from mmdet.structures.mask import BitmapMasks
+                        import numpy as np
+                        ori_masks = data_sample.gt_instances.masks
+                        indices = gt_collected.idx.cpu().numpy()
+                        if isinstance(ori_masks, BitmapMasks):
+                            # 从BitmapMasks中选择
+                            masks_np = ori_masks.masks[indices]
+                            gt_masks = BitmapMasks(masks_np, ori_masks.height, ori_masks.width)
+                        else:
+                            # 如果是Tensor，转换为BitmapMasks
+                            masks_tensor = ori_masks[indices] if isinstance(ori_masks, torch.Tensor) else ori_masks.to_tensor()[indices]
+                            masks_np = masks_tensor.cpu().numpy().astype(np.uint8)
+                            gt_masks = BitmapMasks(masks_np, masks_tensor.shape[-2], masks_tensor.shape[-1])
+                    elif hasattr(gt_collected, 'masks'):
+                        # 直接使用gt_instances_collected中的masks（保持原格式）
+                        from mmdet.structures.mask import BitmapMasks
+                        import numpy as np
+                        if isinstance(gt_collected.masks, BitmapMasks):
+                            gt_masks = gt_collected.masks
+                        elif isinstance(gt_collected.masks, torch.Tensor):
+                            # 转换为BitmapMasks
+                            masks_np = gt_collected.masks.cpu().numpy().astype(np.uint8)
+                            gt_masks = BitmapMasks(masks_np, gt_collected.masks.shape[-2], gt_collected.masks.shape[-1])
+                        else:
+                            gt_masks = gt_collected.masks
+                    else:
+                        # 如果没有masks，使用原始gt_instances的masks
+                        gt_masks = data_sample.gt_instances.masks
+                    
+                    gt_instances = InstanceData(masks=gt_masks)
+                    # 🔥 关键：根据提取的masks数量，相应地选择labels和bboxes
+                    num_selected_masks = len(gt_masks)
+                    if indices is not None:
+                        # 如果有idx，使用相同的索引选择labels和bboxes
+                        # 确定device：优先使用labels的device，如果没有则使用bboxes的device，最后使用masks的device
+                        device = None
+                        if hasattr(data_sample.gt_instances, 'labels') and data_sample.gt_instances.labels is not None:
+                            device = data_sample.gt_instances.labels.device
+                        elif hasattr(data_sample.gt_instances, 'bboxes') and data_sample.gt_instances.bboxes is not None:
+                            device = data_sample.gt_instances.bboxes.device
+                        else:
+                            # 如果没有labels和bboxes，使用masks的device（BitmapMasks没有device，使用cuda）
+                            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                        
+                        indices_tensor = torch.from_numpy(indices).to(device)
+                        if hasattr(data_sample.gt_instances, 'labels') and data_sample.gt_instances.labels is not None:
+                            gt_instances.labels = data_sample.gt_instances.labels[indices_tensor]
+                        if hasattr(data_sample.gt_instances, 'bboxes') and data_sample.gt_instances.bboxes is not None:
+                            gt_instances.bboxes = data_sample.gt_instances.bboxes[indices_tensor]
+                    else:
+                        # 如果没有idx，根据masks数量截取或扩展labels和bboxes
+                        if hasattr(data_sample.gt_instances, 'labels') and data_sample.gt_instances.labels is not None:
+                            num_ori_labels = len(data_sample.gt_instances.labels)
+                            if num_ori_labels >= num_selected_masks:
+                                gt_instances.labels = data_sample.gt_instances.labels[:num_selected_masks]
+                            else:
+                                # 如果原始labels数量不够，重复最后一个
+                                last_label = data_sample.gt_instances.labels[-1:]
+                                gt_instances.labels = torch.cat([data_sample.gt_instances.labels, last_label.repeat(num_selected_masks - num_ori_labels)])
+                        if hasattr(data_sample.gt_instances, 'bboxes') and data_sample.gt_instances.bboxes is not None:
+                            num_ori_bboxes = len(data_sample.gt_instances.bboxes)
+                            if num_ori_bboxes >= num_selected_masks:
+                                gt_instances.bboxes = data_sample.gt_instances.bboxes[:num_selected_masks]
+                            else:
+                                # 如果原始bboxes数量不够，重复最后一个
+                                last_bbox = data_sample.gt_instances.bboxes[-1:]
+                                gt_instances.bboxes = torch.cat([data_sample.gt_instances.bboxes, last_bbox.repeat(num_selected_masks - num_ori_bboxes, 1)])
+                    batch_img_metas.append(data_sample.metainfo)
+                    batch_gt_instances.append(gt_instances)
+                    if 'gt_sem_seg' in data_sample:
+                        batch_gt_semantic_segs.append(data_sample.gt_sem_seg)
+                    else:
+                        batch_gt_semantic_segs.append(None)
+            # 对于prompt_training，也需要调用preprocess_gt来统一格式
+            batch_gt_instances = self.preprocess_gt(batch_gt_instances, batch_gt_semantic_segs)
         else:
             for data_sample in batch_data_samples:
                 if isinstance(data_sample, TrackDataSample):
@@ -972,12 +1251,35 @@ class Mask2FormerVideoHead(AnchorFreeHead):
                         batch_gt_semantic_segs.append(None)
             batch_gt_instances = self.preprocess_gt(batch_gt_instances, batch_gt_semantic_segs)
         # forward
+        # 🔥 关键：保存prompt_training的值，因为forward可能会修改它
+        saved_prompt_training = self.prompt_training
         all_cls_scores, all_mask_preds, all_iou_preds, _ = self(x, batch_data_samples)
+        # 🔥 恢复prompt_training的值
+        self.prompt_training = saved_prompt_training
 
         # loss
         if isinstance(batch_data_samples[0], TrackDataSample):
             num_frames = len(batch_img_metas[0])
-            all_mask_preds = [mask.flatten(2, 3) for mask in all_mask_preds]
+            
+            # 🔥 关键：对于prompt_training=True的视频交互任务，需要扩展cls_scores、mask_preds和iou_preds
+            # mask_preds的形状是(bs, num_queries, num_frames, h, w)，需要reshape成(bs * num_frames, num_queries, h, w)
+            if self.prompt_training:
+                # 视频交互任务：扩展cls_scores、mask_preds和iou_preds
+                all_cls_scores = [
+                    cls.repeat_interleave(num_frames, dim=0) if cls.dim() == 3
+                    else cls for cls in all_cls_scores
+                ]
+                all_mask_preds = [
+                    mask.permute(0, 2, 1, 3, 4).flatten(0, 1).flatten(2, 3) if mask.dim() == 5 and mask.shape[2] == num_frames
+                    else mask.flatten(2, 3) for mask in all_mask_preds
+                ]
+                all_iou_preds = [
+                    iou.repeat_interleave(num_frames, dim=0) if iou is not None and iou.dim() == 3 and iou.shape[2] == 1
+                    else iou for iou in all_iou_preds
+                ]
+            else:
+                # VOS任务：只flatten空间维度，不扩展batch维度
+                all_mask_preds = [mask.flatten(2, 3) for mask in all_mask_preds]
             for instance in batch_gt_instances:
                 instance['masks'] = instance['masks'].flatten(1, 2)
             film_metas = [
@@ -1020,6 +1322,11 @@ class Mask2FormerVideoHead(AnchorFreeHead):
         if isinstance(data_sample, TrackDataSample):
             img_shape = data_sample[0].metainfo['batch_input_shape']
             num_frames = len(data_sample)
+            # 检查视频任务中的交互prompt
+            if hasattr(data_sample, 'video_data_samples') and len(data_sample.video_data_samples) > 0:
+                first_frame = data_sample.video_data_samples[0]
+                if hasattr(first_frame, 'gt_instances_collected') and first_frame.gt_instances_collected is not None:
+                    self.prompt_training = True
         else:
             if 'gt_instances_collected' in data_sample:
                 self.prompt_training = True
@@ -1050,22 +1357,170 @@ class Mask2FormerVideoHead(AnchorFreeHead):
         scalar, noise_scale = 100, 0.4
         gt_instances = [t.gt_instances_collected for t in batch_data_samples]
 
-        point_coords = torch.stack([inst.point_coords for inst in gt_instances])
-        pb_labels = torch.stack([inst['pb_labels'] for inst in gt_instances])
-        labels = torch.zeros_like(pb_labels).long()
+        # 🔥 关键：不同样本可能有不同数量的prompts，需要分别处理
+        # 不能直接使用torch.stack，因为不同样本的prompt数量可能不同
+        point_coords_list = [inst.point_coords for inst in gt_instances]
+        
+        # 检查并创建 pb_labels，如果不存在则使用默认值（全1）
+        pb_labels_list = []
+        for inst in gt_instances:
+            if hasattr(inst, 'pb_labels'):
+                pb_labels_list.append(inst.pb_labels)
+            else:
+                # 如果没有 pb_labels，创建默认值（全1，表示正样本）
+                device = inst.point_coords.device
+                pb_labels = torch.ones(len(inst.point_coords), dtype=torch.long, device=device)
+                pb_labels_list.append(pb_labels)
+        
+        labels_list = [torch.zeros_like(pb_labels) for pb_labels in pb_labels_list]
 
-        boxes = point_coords  # + boxes
+        # 🔥 关键：point_coords 已经是 box 格式 [x1, y1, x2, y2]
+        # 在 GeneratePoint 中，point_coords 是通过 torch.cat([selected_point - 3, selected_point + 3], 0) 生成的
+        # 这实际上就是 box 格式：[x-3, y-3, x+3, y+3] = [x1, y1, x2, y2]
+        # 所以应该直接使用 point_coords 作为 boxes，就像 OMG-Seg 和 RMP-SAM 一样
+        boxes_list = []
+        factors_list = []
+        
+        for i, (inst, data_sample) in enumerate(zip(gt_instances, batch_data_samples)):
+            h, w = data_sample.metainfo['img_shape']
+            point_coords = point_coords_list[i]
+            
+            # 检查是否有真正的 bboxes（用户提供的 box prompt）
+            if hasattr(inst, 'bboxes') and inst.bboxes is not None:
+                # 使用实际的box坐标（用户提供的 box prompt）
+                boxes = inst.bboxes
+                # 确保 boxes 是 [num_points, 4] 格式
+                if boxes.dim() == 2 and boxes.shape[1] != 4:
+                    if boxes.shape[1] == 2:
+                        # 如果是 [num_points, 2]，转换为 box 格式
+                        radius = 5.0
+                        boxes = torch.cat([
+                            boxes - radius,  # x1, y1
+                            boxes + radius   # x2, y2
+                        ], dim=-1)  # [num_points, 4]
+                    else:
+                        raise ValueError(f"Unexpected bboxes shape: {boxes.shape}, expected [num_points, 4] or [num_points, 2]")
+            else:
+                # 处理 point_coords：可能是 [num_points, 4] 或 [num_points, 2]
+                if point_coords.dim() == 2:
+                    if point_coords.shape[1] == 4:
+                        # point_coords 是 [num_points, 4]，格式为 [x1, y1, x2, y2]（box格式）
+                        # 这是 GeneratePoint 生成的标准格式
+                        boxes = point_coords
+                    elif point_coords.shape[1] == 2:
+                        # point_coords 是 [num_points, 2]，格式为 [x, y]（单个点）
+                        # 需要从点生成 box（测试代码或某些数据源可能使用这种格式）
+                        radius = 5.0  # 像素半径
+                        boxes = torch.cat([
+                            point_coords - radius,  # x1, y1
+                            point_coords + radius   # x2, y2
+                        ], dim=-1)  # [num_points, 4]
+                    else:
+                        raise ValueError(f"Unexpected point_coords shape: {point_coords.shape}, expected [num_points, 2] or [num_points, 4]")
+                else:
+                    raise ValueError(f"Unexpected point_coords dimension: {point_coords.dim()}, expected 2")
+            
+            # 创建factors：每个box对应一个factor
+            factor = boxes.new_tensor([w, h, w, h]).unsqueeze(0).repeat(boxes.size(0), 1)
+            
+            boxes_list.append(boxes)
+            factors_list.append(factor)
+        
+        # 🔥 关键：找到最大数量的prompts，进行padding以支持batch处理
+        max_num_prompts = max(len(boxes) for boxes in boxes_list)
+        device = boxes_list[0].device
+        
+        # Padding boxes和factors到相同长度
+        boxes_padded = []
+        factors_padded = []
+        labels_padded = []
+        pb_labels_padded = []
+        point_coords_padded = []
+        
+        for i, (boxes, factors, labels, pb_labels, point_coords) in enumerate(zip(
+            boxes_list, factors_list, labels_list, pb_labels_list, point_coords_list)):
+            num_prompts = len(boxes)
+            if num_prompts < max_num_prompts:
+                # 需要padding
+                pad_size = max_num_prompts - num_prompts
+                # Padding boxes（使用最后一个box）
+                last_box = boxes[-1:].repeat(pad_size, 1)
+                boxes = torch.cat([boxes, last_box], dim=0)
+                # Padding factors
+                last_factor = factors[-1:].repeat(pad_size, 1)
+                factors = torch.cat([factors, last_factor], dim=0)
+                # Padding labels
+                last_label = labels[-1:].repeat(pad_size)
+                labels = torch.cat([labels, last_label], dim=0)
+                # Padding pb_labels
+                last_pb_label = pb_labels[-1:].repeat(pad_size)
+                pb_labels = torch.cat([pb_labels, last_pb_label], dim=0)
+                # Padding point_coords
+                # 🔥 关键：point_coords 的维度应该与 boxes 的维度一致
+                # 如果 point_coords 是 [num_points, 2]，但 boxes 是 [num_points, 4]
+                # 说明 point_coords 已经被转换为 boxes，所以应该用 boxes 来 padding point_coords
+                if point_coords.shape[1] == boxes.shape[1]:
+                    # 维度一致，直接 padding
+                    last_point = point_coords[-1:].repeat(pad_size, 1)
+                    point_coords = torch.cat([point_coords, last_point], dim=0)
+                elif point_coords.shape[1] == 2 and boxes.shape[1] == 4:
+                    # point_coords 是 [num_points, 2]，但 boxes 是 [num_points, 4]
+                    # 说明 point_coords 已经被转换为 boxes，用 boxes 的最后一个来 padding point_coords
+                    # 但 point_coords 需要保持原始格式，所以用最后一个 point_coords 来 padding
+                    last_point = point_coords[-1:].repeat(pad_size, 1)
+                    point_coords = torch.cat([point_coords, last_point], dim=0)
+                else:
+                    # 其他情况，尝试用 boxes 的最后一个点（取前2维）来 padding
+                    if boxes.shape[1] >= 2:
+                        last_point = boxes[-1:, :2].repeat(pad_size, 1)
+                        point_coords = torch.cat([point_coords, last_point], dim=0)
+                    else:
+                        raise ValueError(f"Cannot pad point_coords: point_coords.shape={point_coords.shape}, boxes.shape={boxes.shape}")
+            
+            boxes_padded.append(boxes)
+            factors_padded.append(factors)
+            labels_padded.append(labels)
+            pb_labels_padded.append(pb_labels)
+            point_coords_padded.append(point_coords)
+        
+        # 现在可以stack了
+        # 🔥 关键：确保所有样本的 point_coords 维度一致
+        # 检查第一个样本的维度，然后统一所有样本
+        if len(point_coords_padded) > 0:
+            first_point_coords_dim = point_coords_padded[0].shape[1]
+            # 统一所有样本的 point_coords 维度
+            for i in range(len(point_coords_padded)):
+                if point_coords_padded[i].shape[1] != first_point_coords_dim:
+                    # 如果维度不一致，需要转换
+                    if point_coords_padded[i].shape[1] == 2 and first_point_coords_dim == 4:
+                        # 当前是 [num_points, 2]，需要转换为 [num_points, 4]
+                        # 但这里只是为了 stack，所以可以简单地用 boxes 的前2维
+                        # 或者用最后一个 point_coords 重复
+                        # 实际上，point_coords 主要用于计算 box_start，维度不重要
+                        # 但为了能 stack，我们需要统一维度
+                        # 简单方法：用 boxes 的前2维
+                        if len(boxes_padded) > i and boxes_padded[i].shape[1] >= 2:
+                            point_coords_padded[i] = boxes_padded[i][:, :2]
+                        else:
+                            # 如果 boxes 也不可用，用最后一个 point_coords 重复
+                            last_point = point_coords_padded[i][-1:].repeat(point_coords_padded[i].shape[0], 1)
+                            point_coords_padded[i] = torch.cat([point_coords_padded[i], last_point[:, :2]], dim=-1)
+                    elif point_coords_padded[i].shape[1] == 4 and first_point_coords_dim == 2:
+                        # 当前是 [num_points, 4]，需要转换为 [num_points, 2]
+                        # 取前2维
+                        point_coords_padded[i] = point_coords_padded[i][:, :2]
+        
+        boxes = torch.stack(boxes_padded, 0)
+        factors = torch.stack(factors_padded, 0)
+        labels = torch.stack(labels_padded, 0)
+        pb_labels = torch.stack(pb_labels_padded, 0)
+        point_coords = torch.stack(point_coords_padded, 0)
 
-        factors = []
-        for i, data_sample in enumerate(batch_data_samples):
-            h, w, = data_sample.metainfo['img_shape']
-            factor = boxes[i].new_tensor([w, h, w, h]).unsqueeze(0).repeat(boxes[i].size(0), 1)
-            factors.append(factor)
-        factors = torch.stack(factors, 0)
-
-        boxes = bbox_xyxy_to_cxcywh(boxes / factors)  # xyxy / factor or xywh / factor ????
+        # 归一化并转换为 cxcywh 格式
+        boxes = bbox_xyxy_to_cxcywh(boxes / factors)
         # box_start = [t['box_start'] for t in targets]
-        box_start = [len(point) for point in point_coords]
+        # 🔥 关键：使用原始的point_coords_list计算box_start（padding前的长度）
+        box_start = [len(point) for point in point_coords_list]
 
         known_labels = labels
         known_pb_labels = pb_labels
@@ -1077,12 +1532,14 @@ class Mask2FormerVideoHead(AnchorFreeHead):
 
         if noise_scale > 0 and self.training:
             diff = torch.zeros_like(known_bbox_expand)
+            # Box coordinates: 4维 (cx, cy, w, h)
             diff[:, :, :2] = known_bbox_expand[:, :, 2:] / 2
             diff[:, :, 2:] = known_bbox_expand[:, :, 2:]
             # add very small noise to input points; no box
             sc = 0.01
             for i, st in enumerate(box_start):
                 diff[i, :st] = diff[i, :st] * sc
+            
             known_bbox_expand += torch.mul(
                 (torch.rand_like(known_bbox_expand) * 2 - 1.0),
                 diff) * noise_scale

@@ -73,13 +73,17 @@ task_router = dict(
 # 3. 当batch属于某个任务时，基础loss保持激活，只屏蔽其他任务的特定loss
 #    这样既避免了任务间loss冲突，又保证了所有模块参与梯度计算（DDP要求）
 task_loss_weights = dict(
+    # 🔥 关键：这里的权重是相对于loss函数内部loss_weight的额外权重
+    # CrossEntropyLoss和DiceLoss内部已经应用了loss_weight（5.0），
+    # 所以这里应该设置为1.0，避免权重被重复应用导致loss过大
+    
     # 图像交互分割（点、框、文本提示）
     interactive_image=dict(
         # 基础loss
         loss_cls=0.0,      # 交互任务不需要分类（用户已通过prompt指定目标）
-        loss_mask=5.0,     # mask loss
-        loss_dice=5.0,     # dice loss
-        loss_iou=10.0,     # IoU预测loss（预测mask质量）
+        loss_mask=1.0,     # mask loss（loss_weight已在CrossEntropyLoss内部应用）
+        loss_dice=1.0,     # dice loss（loss_weight已在DiceLoss内部应用）
+        loss_iou=1.0,      # IoU预测loss（降低权重，避免过大）
         # 任务特定loss（激活）
         loss_prompt_align=0.5,    # prompt对齐loss
         loss_text_visual=0.3,     # 文本-视觉对齐loss
@@ -94,9 +98,9 @@ task_loss_weights = dict(
     interactive_video=dict(
         # 基础loss
         loss_cls=0.0,      # 交互任务不需要分类（用户已通过prompt指定目标）
-        loss_mask=5.0,
-        loss_dice=5.0,
-        loss_iou=10.0,     # IoU预测loss（预测mask质量）
+        loss_mask=1.0,     # mask loss（loss_weight已在CrossEntropyLoss内部应用）
+        loss_dice=1.0,     # dice loss（loss_weight已在DiceLoss内部应用）
+        loss_iou=1.0,      # IoU预测loss（降低权重，避免过大）
         # 任务特定loss（激活）
         loss_prompt_align=0.5,
         loss_text_visual=0.3,
@@ -111,8 +115,8 @@ task_loss_weights = dict(
     vos=dict(
         # 基础loss
         loss_cls=1.0,
-        loss_mask=5.0,
-        loss_dice=5.0,
+        loss_mask=1.0,     # mask loss（loss_weight已在CrossEntropyLoss内部应用）
+        loss_dice=1.0,     # dice loss（loss_weight已在DiceLoss内部应用）
         loss_iou=0.0,             # VOS不需要IoU预测（使用cls_score表示置信度）
         # 任务特定loss（激活）
         loss_dpsr=2.0,            # 双路径自优化loss
@@ -128,8 +132,8 @@ task_loss_weights = dict(
     panoptic=dict(
         # 基础loss
         loss_cls=2.0,             # 全景分割需要更强的分类约束
-        loss_mask=5.0,
-        loss_dice=5.0,
+        loss_mask=1.0,     # mask loss（loss_weight已在CrossEntropyLoss内部应用）
+        loss_dice=1.0,     # dice loss（loss_weight已在DiceLoss内部应用）
         loss_iou=0.0,             # 全景分割不需要IoU预测（使用cls_score表示置信度）
         # 任务特定loss（激活）
         loss_panoptic=1.0,        # 全景分割特定loss
@@ -184,7 +188,7 @@ model = dict(
     type=RapSAM,
     data_preprocessor=data_preprocessor,
     # Multi-task configuration
-    use_task_router=True,
+    # use_task_router=True,
     task_router=task_router,
     task_loss_weights=task_loss_weights,  # 传递任务特定loss权重
     use_streaming_memory=True,

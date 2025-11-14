@@ -217,10 +217,17 @@ def test_forward_pass(config_path='/mnt/chenjiahui/Fastsam2-main/configs/rap_sam
         model = model.cuda()
         model.train()
         print("✓ 模型构建成功")
-        print(f"   - 使用TaskRouter: {model.use_task_router}")
-        print(f"   - 使用StreamingMemory: {model.use_streaming_memory}")
-        print(f"   - 使用PromptFusion: {model.use_prompt_fusion}")
-        print(f"   - Loss权重配置: {len(model.task_loss_weights)} 个任务类型")
+        # 检查模型是否有这些属性（兼容不同版本的实现）
+        if hasattr(model, 'use_task_router'):
+            print(f"   - 使用TaskRouter: {model.use_task_router}")
+        if hasattr(model, 'use_streaming_memory'):
+            print(f"   - 使用StreamingMemory: {model.use_streaming_memory}")
+        if hasattr(model, 'use_prompt_fusion'):
+            print(f"   - 使用PromptFusion: {model.use_prompt_fusion}")
+        if hasattr(model, 'task_loss_weights') and model.task_loss_weights is not None:
+            print(f"   - Loss权重配置: {len(model.task_loss_weights)} 个任务类型")
+        else:
+            print(f"   - 任务类型检测: 自动检测（基于数据样本）")
     except Exception as e:
         print(f"✗ 模型构建失败: {e}")
         import traceback

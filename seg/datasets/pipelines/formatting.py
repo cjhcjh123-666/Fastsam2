@@ -307,3 +307,5 @@ class GeneratePoint(BaseTransform):
             idx=torch.tensor(valid_indices, dtype=torch.long) if len(valid_indices) > 0 else torch.tensor([0], dtype=torch.long)
         )
         return results
+
+
