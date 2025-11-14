@@ -142,87 +142,9 @@ class RapSAM(Mask2formerVideo):
             x = self.extract_feat(batch_inputs)
         
         # Forward through head
-        # For RefCOCO dataset with text, we need forward results for text alignment loss
-        # Check if we have text in any sample
-        has_text = False
-        if self.use_prompt_fusion and self.prompt_fusion is not None:
-            has_text = any(
-                hasattr(ds, 'metainfo') and 'text' in ds.metainfo
-                for ds in batch_data_samples
-            )
-        
-        if has_text:
-            # Do forward pass first to get visual features for text alignment loss
-            all_cls_scores, all_mask_preds, all_iou_preds, _ = \
-                self.panoptic_head(x, batch_data_samples)
-            forward_results = (all_cls_scores, all_mask_preds, all_iou_preds, None)
-            
-            # Extract batch_gt_instances and batch_img_metas for loss_by_feat
-            # Reuse the same logic as in head's loss method
-            batch_img_metas = []
-            batch_gt_instances = []
-            batch_gt_semantic_segs = []
-            
-            from mmdet.structures import TrackDataSample
-            from mmengine.structures import InstanceData
-            
-            # Check if prompt_training mode (SAM dataset)
-            is_prompt_training = batch_data_samples[0].get('data_tag', 'coco') == 'sam'
-            
-            if is_prompt_training:
-                for data_sample in batch_data_samples:
-                    device = data_sample.gt_instances.labels.device
-                    ori_masks = data_sample.gt_instances.masks.to_tensor(torch.bool, device)
-                    indices = data_sample.gt_instances_collected.idx
-                    gt_masks = ori_masks[indices]
-                    gt_instances = InstanceData(masks=gt_masks)
-                    batch_img_metas.append(data_sample.metainfo)
-                    batch_gt_instances.append(gt_instances)
-            else:
-                for data_sample in batch_data_samples:
-                    if isinstance(data_sample, TrackDataSample):
-                        clip_meta = []
-                        clip_instances = []
-                        clip_sem_seg = []
-                        for det_sample in data_sample:
-                            clip_meta.append(det_sample.metainfo)
-                            clip_instances.append(det_sample.gt_instances)
-                            if 'gt_sem_seg' in det_sample:
-                                clip_sem_seg.append(det_sample.gt_sem_seg)
-                            else:
-                                clip_sem_seg.append(None)
-                        batch_img_metas.append(clip_meta)
-                        batch_gt_instances.append(clip_instances)
-                        batch_gt_semantic_segs.append(clip_sem_seg)
-                    else:
-                        batch_img_metas.append(data_sample.metainfo)
-                        batch_gt_instances.append(data_sample.gt_instances)
-                        if 'gt_sem_seg' in data_sample:
-                            batch_gt_semantic_segs.append(data_sample.gt_sem_seg)
-                        else:
-                            batch_gt_semantic_segs.append(None)
-                
-                # Preprocess GT if needed
-                if hasattr(self.panoptic_head, 'preprocess_gt'):
-                    batch_gt_instances = self.panoptic_head.preprocess_gt(
-                        batch_gt_instances, batch_gt_semantic_segs
-                    )
-            
-            # Compute loss with forward results
-            losses = self.panoptic_head.loss_by_feat(
-                all_cls_scores, all_mask_preds, all_iou_preds, 
-                batch_gt_instances, batch_img_metas
-            )
-            
-            # Add text-visual alignment loss
-            text_alignment_loss = self._compute_text_visual_alignment_loss(
-                batch_data_samples, forward_results
-            )
-            if text_alignment_loss is not None:
-                losses['loss_text_align'] = text_alignment_loss
-        else:
-            # Normal path: no text, use standard loss computation
-            losses = self.panoptic_head.loss(x, batch_data_samples)
+        # IMPORTANT: In distributed training, all ranks must follow the same code path
+        # to avoid NCCL synchronization timeouts. We always use the standard loss path.
+        losses = self.panoptic_head.loss(x, batch_data_samples)
         
         # Add task-specific losses (e.g., DPSR for VOS)
         if routing_config and routing_config.get('task_specific_config', {}).get('enable_dpsr'):
