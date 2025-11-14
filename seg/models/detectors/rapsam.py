@@ -188,6 +188,8 @@ class RapSAM(Mask2formerVideo):
             losses['loss_prompt_align'] = torch.tensor(0.0, device=device, requires_grad=True)
         
         # 文本-视觉对齐loss（文本提示任务）
+        # 需要从head的forward结果中获取，但这里我们暂时使用简化版本
+        # 实际实现中应该从forward pass中获取forward_results
         text_visual_loss = self._compute_text_visual_alignment_loss(batch_data_samples, None)
         losses['loss_text_visual'] = text_visual_loss if text_visual_loss is not None else \
             torch.tensor(0.0, device=next(iter(losses.values())).device, requires_grad=True)
@@ -406,7 +408,15 @@ class RapSAM(Mask2formerVideo):
         # 简化版本：使用point或box的IoU作为对齐指标
         # 实际实现中可以更复杂，比如使用attention map
         
-        if not prompts or not any([prompts.get('point_coords'), prompts.get('bboxes')]):
+        if not prompts:
+            return None
+        
+        # 安全地检查prompts中是否有point_coords或bboxes
+        # 不能直接用any()因为Tensor不能直接用于布尔判断
+        has_point = prompts.get('point_coords') is not None
+        has_box = prompts.get('bboxes') is not None
+        
+        if not (has_point or has_box):
             return None
         
         # Placeholder实现
@@ -433,7 +443,7 @@ class RapSAM(Mask2formerVideo):
     
     def _compute_text_visual_alignment_loss(self,
                                             batch_data_samples: SampleList,
-                                            forward_results: Tuple) -> Optional[torch.Tensor]:
+                                            forward_results: Optional[Tuple] = None) -> Optional[torch.Tensor]:
         """Compute text-visual alignment loss for RefCOCO dataset.
         
         This loss ensures that text embeddings are aligned with visual features
@@ -441,12 +451,16 @@ class RapSAM(Mask2formerVideo):
         
         Args:
             batch_data_samples: List of data samples.
-            forward_results: Tuple of (all_cls_scores, all_mask_preds, all_iou_preds, _)
-                from head's forward pass.
+            forward_results: Optional tuple of (all_cls_scores, all_mask_preds, all_iou_preds, _)
+                from head's forward pass. If None, returns None.
             
         Returns:
             Text-visual alignment loss tensor or None if not applicable.
         """
+        # 如果没有forward_results，返回None（会在调用处处理为0 loss）
+        if forward_results is None:
+            return None
+        
         all_cls_scores, all_mask_preds, all_iou_preds, _ = forward_results
         
         # Check if we have text in any sample

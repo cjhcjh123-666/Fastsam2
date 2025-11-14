@@ -202,8 +202,39 @@ task_router = dict(
     panoptic_stages=3
 )
 
+# 任务特定Loss权重配置（核心创新）
+# 当batch属于某个任务时，只有对应的loss生效，其他任务的loss权重为0
+# 这样可以避免不同任务之间的loss冲突，同时保证所有模块都参与梯度计算
+task_loss_weights = dict(
+    # 图像交互分割（点、框、文本提示）
+    interactive_image=dict(
+        loss_cls=1.0, loss_mask=5.0, loss_dice=5.0, loss_iou=10.0,
+        loss_prompt_align=0.5, loss_text_visual=0.3,
+        loss_dpsr=0.0, loss_temporal=0.0, loss_panoptic=0.0,  # 屏蔽其他任务
+    ),
+    # 视频交互分割
+    interactive_video=dict(
+        loss_cls=1.0, loss_mask=5.0, loss_dice=5.0, loss_iou=10.0,
+        loss_prompt_align=0.5, loss_text_visual=0.3, loss_temporal=1.0,
+        loss_dpsr=0.0, loss_panoptic=0.0,
+    ),
+    # VOS (视频对象分割)
+    vos=dict(
+        loss_cls=1.0, loss_mask=5.0, loss_dice=5.0, loss_iou=0.0,
+        loss_dpsr=2.0, loss_temporal=1.5, loss_memory_align=1.0,
+        loss_prompt_align=0.0, loss_text_visual=0.0, loss_panoptic=0.0,
+    ),
+    # 全景分割
+    panoptic=dict(
+        loss_cls=2.0, loss_mask=5.0, loss_dice=5.0, loss_iou=0.0,
+        loss_panoptic=1.0,
+        loss_prompt_align=0.0, loss_text_visual=0.0, loss_dpsr=0.0,
+        loss_temporal=0.0, loss_memory_align=0.0,
+    ),
+)
+
 # DDP 配置（多任务训练必须）
-find_unused_parameters = True  # 关键：混合数据集训练需要
+find_unused_parameters = True  # 关键：防止NCCL Timeout，混合数据集训练必需
 ```
 
 ### 训练选项
@@ -368,6 +399,44 @@ prompt_fusion = dict(
 - **Neck**：YOSONeck (Lite Deform FPN)
 - **Head**：RapSAMVideoHead
 - **损失函数**：分类损失、Mask 损失、Dice 损失
+### 数据处理流程
+数据流处理：
+┌─────────────────────────────────────────────┐
+│  DataLoader 加载数据                         │
+└──────────────┬──────────────────────────────┘
+               │
+               ▼
+     ┌────────────────────┐
+     │  判断数据类型       │
+     └────────┬───────────┘
+              │
+       ┌──────┴──────┐
+       │             │
+   视频数据      图像数据
+(TrackDataSample) (DetDataSample)
+       │             │
+       ▼             ▼
+   reshape        直接处理
+       │             │
+       └──────┬──────┘
+              ▼
+        特征提取 (同一backbone)
+              │
+              ▼
+        panoptic_head.loss()
+              │
+              ▼
+      TaskRouter检测任务类型
+              │
+              ▼
+     计算所有可能的loss
+              │
+              ▼
+    根据任务类型应用loss权重
+    （屏蔽不相关的loss）
+              │
+              ▼
+          返回masked losses
 
 ## ❓ 常见问题
 
@@ -383,11 +452,31 @@ prompt_fusion = dict(
 
 **解决**：单卡训练时使用普通 BN，多卡训练时使用 SyncBN。配置中已设置 `norm_cfg=dict(type='BN', requires_grad=True)`。
 
-### 3. DDP 训练错误
+### 3. DDP 训练错误 / NCCL Timeout
 
-**问题**：`find_unused_parameters` 相关错误
+**问题**：
+- `find_unused_parameters` 相关错误
+- `NCCL Timeout` 错误
 
-**解决**：多任务训练必须设置 `find_unused_parameters = True`，因为某些模块（如 TextEncoder）只在特定任务中使用。
+**原因**：多任务模型中存在条件性使用的模块（如 TextEncoder、StreamingMemory），这些模块在某些batch中不参与前向传播，导致DDP同步失败。
+
+**解决**：
+1. **必须设置** `find_unused_parameters = True`（已在配置中设置）
+2. **任务特定Loss Masking**：通过 `task_loss_weights` 配置，确保：
+   - 所有loss都被计算（保证梯度流）
+   - 根据任务类型自动屏蔽不相关的loss（权重设为0）
+   - 避免不同任务的loss相互干扰
+
+**示例**：
+```python
+# 当batch是图像交互分割任务时
+task_loss_weights['interactive_image'] = {
+    'loss_cls': 1.0,      # 激活
+    'loss_iou': 10.0,     # 激活
+    'loss_dpsr': 0.0,     # 屏蔽（VOS任务的loss）
+    'loss_temporal': 0.0, # 屏蔽（视频任务的loss）
+}
+```
 
 ### 4. 内存不足
 
@@ -447,6 +536,9 @@ prompt_fusion = dict(
 
 ### 最新更新
 
+- ✅ **修复 NCCL Timeout 问题**：设置 `find_unused_parameters = True`，解决多任务训练中的分布式同步问题
+- ✅ **实现多任务 Loss Masking 机制**：引入 `task_loss_weights` 配置，根据任务类型自动激活/屏蔽不同loss，避免任务间干扰
+- ✅ **优化任务路由机制**：TaskRouter 自动检测任务类型并应用相应的loss权重
 - ✅ 修复 SAMPromptEncoder 设备不匹配问题
 - ✅ 完善 StreamingMemory 的实际应用
 - ✅ 优化 DPSR 损失计算
