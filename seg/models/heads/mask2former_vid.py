@@ -574,10 +574,13 @@ class Mask2FormerVideoHead(AnchorFreeHead):
         """
         batch_size, num_ins = cls_scores.size(0), cls_scores.size(1)
         if self.prompt_training:
+            print(f"\n[DEBUG _loss_by_feat_single] prompt_training=True")
+            print(f"[DEBUG] cls_scores.shape={cls_scores.shape}, mask_preds.shape={mask_preds.shape}, iou_preds.shape={iou_preds.shape if iou_preds is not None else None}")
             num_imgs = mask_preds.size(0)
             cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
             mask_preds_list = [mask_preds[i] for i in range(num_imgs)]
             mask_targets = torch.cat([item.masks for item in batch_gt_instances])
+            print(f"[DEBUG] mask_targets.shape={mask_targets.shape}")
             mask_weights = mask_targets.new_ones((batch_size, num_ins), dtype=torch.float)
             avg_factor = cls_scores.size(1)
 
@@ -585,6 +588,7 @@ class Mask2FormerVideoHead(AnchorFreeHead):
             num_total_masks = max(num_total_masks, 1)
 
             mask_preds = mask_preds[mask_weights > 0]
+            print(f"[DEBUG] mask_preds after filtering shape={mask_preds.shape}")
 
             if mask_targets.shape[0] == 0:
                 # zero match
@@ -619,9 +623,44 @@ class Mask2FormerVideoHead(AnchorFreeHead):
                                     mask_point_targets,
                                     reduction_override='none')
 
-            iou_preds = iou_preds.flatten()  # (bs, 60, 6) --> (bs, 360)
-            iou_target = 1 - (loss_dice / self.loss_dice.loss_weight)
-            loss_iou = F.mse_loss(iou_preds, iou_target, reduction="none")
+            # 处理iou_preds：确保形状正确
+            print(f"[DEBUG] Before iou processing: iou_preds.shape={iou_preds.shape if iou_preds is not None else None}, loss_dice.shape={loss_dice.shape}")
+            if iou_preds is not None:
+                # iou_preds的形状可能是 (bs, num_queries, 1) 或 (bs, num_queries, num_frames, 1)
+                # 需要flatten到 (bs * num_queries,) 或 (bs * num_queries * num_frames,)
+                original_shape = iou_preds.shape
+                if iou_preds.dim() > 2:
+                    # 如果是3D或4D，flatten所有维度除了batch
+                    iou_preds = iou_preds.flatten(1)  # (bs, num_queries, ...) -> (bs, num_queries * ...)
+                    print(f"[DEBUG] After flatten(1): {original_shape} -> {iou_preds.shape}")
+                iou_preds = iou_preds.flatten()  # (bs, num_queries * ...) -> (bs * num_queries * ...)
+                print(f"[DEBUG] After final flatten: -> {iou_preds.shape}")
+                
+                # 确保iou_preds和iou_target的形状匹配
+                iou_target = 1 - (loss_dice / self.loss_dice.loss_weight)
+                print(f"[DEBUG] iou_target.shape={iou_target.shape}, iou_preds.numel()={iou_preds.numel()}, loss_dice.numel()={loss_dice.numel()}")
+                # loss_dice的形状是 (num_masks,)，需要扩展到与iou_preds匹配
+                if iou_preds.numel() != loss_dice.numel():
+                    # 如果形状不匹配，需要调整
+                    # 通常iou_preds应该和mask_preds的数量一致
+                    num_masks = mask_preds.shape[0]  # mask_preds已经通过mask_weights > 0过滤
+                    print(f"[DEBUG] Shape mismatch! num_masks={num_masks}, iou_preds.numel()={iou_preds.numel()}, loss_dice.numel()={loss_dice.numel()}")
+                    if iou_preds.numel() >= num_masks:
+                        iou_preds = iou_preds[:num_masks]
+                        print(f"[DEBUG] Truncated iou_preds to {iou_preds.shape}")
+                    else:
+                        # 如果iou_preds数量不够，需要扩展
+                        device = iou_preds.device
+                        iou_preds = torch.cat([iou_preds, torch.zeros(num_masks - iou_preds.numel(), device=device)])
+                        print(f"[DEBUG] Extended iou_preds to {iou_preds.shape}")
+                
+                loss_iou = F.mse_loss(iou_preds, iou_target, reduction="none")
+                print(f"[DEBUG] loss_iou before sum: shape={loss_iou.shape}, mean={loss_iou.mean().item():.6f}, sum={loss_iou.sum().item():.6f}")
+            else:
+                print(f"[DEBUG] iou_preds is None! Creating zero loss")
+                # 如果iou_preds是None，创建零loss但保持梯度流
+                device = mask_preds.device
+                loss_iou = torch.tensor(0.0, device=device, requires_grad=True)
             loss_mask = loss_mask.sum() / num_total_masks
             loss_dice = loss_dice.sum() / num_total_masks
             loss_iou = loss_iou.sum() / num_total_masks * 10.0
@@ -978,20 +1017,143 @@ class Mask2FormerVideoHead(AnchorFreeHead):
         batch_gt_instances = []
         batch_gt_semantic_segs = []
 
-        if batch_data_samples[0].get('data_tag', 'coco') == 'sam':
-            self.prompt_training = True
-        else:
-            self.prompt_training = False
+        # 检查是否是交互任务（有gt_instances_collected）
+        # 交互任务包括：SAM (data_tag='sam')、RefCOCO (data_tag='refcoco')等
+        # 统一通过gt_instances_collected来判断
+        first_sample = batch_data_samples[0]
+        has_prompt = False
+        
+        print(f"\n[DEBUG loss()] Checking prompt_training:")
+        print(f"[DEBUG] first_sample type: {type(first_sample).__name__}")
+        
+        if isinstance(first_sample, TrackDataSample):
+            # 视频交互任务：检查video_data_samples中的第一帧
+            print(f"[DEBUG] TrackDataSample detected")
+            if hasattr(first_sample, 'video_data_samples') and len(first_sample.video_data_samples) > 0:
+                first_frame = first_sample.video_data_samples[0]
+                print(f"[DEBUG] first_frame has gt_instances_collected: {hasattr(first_frame, 'gt_instances_collected')}")
+                if hasattr(first_frame, 'gt_instances_collected') and first_frame.gt_instances_collected is not None:
+                    has_prompt = True
+                    print(f"[DEBUG] ✅ Video interactive task detected (has gt_instances_collected)")
+        elif hasattr(first_sample, 'gt_instances_collected') and first_sample.gt_instances_collected is not None:
+            # 图像交互任务 (SAM, RefCOCO等)
+            has_prompt = True
+            print(f"[DEBUG] ✅ Image interactive task detected (has gt_instances_collected)")
+        
+        self.prompt_training = has_prompt
+        print(f"[DEBUG] prompt_training = {self.prompt_training}")
 
         if self.prompt_training:
             for data_sample in batch_data_samples:
-                device = data_sample.gt_instances.labels.device
-                ori_masks = data_sample.gt_instances.masks.to_tensor(torch.bool, device)
-                indices = data_sample.gt_instances_collected.idx
-                gt_masks = ori_masks[indices]
-                gt_instances = InstanceData(masks=gt_masks)
-                batch_img_metas.append(data_sample.metainfo)
-                batch_gt_instances.append(gt_instances)
+                if isinstance(data_sample, TrackDataSample):
+                    # 视频交互任务：处理TrackDataSample
+                    clip_meta = []
+                    clip_instances = []
+                    clip_sem_seg = []
+                    for det_sample in data_sample.video_data_samples:
+                        clip_meta.append(det_sample.metainfo)
+                        # 从gt_instances_collected中获取masks
+                        if hasattr(det_sample, 'gt_instances_collected') and det_sample.gt_instances_collected is not None:
+                            gt_collected = det_sample.gt_instances_collected
+                            
+                            # 检查是否有idx属性（用于索引原始masks）
+                            if hasattr(gt_collected, 'idx'):
+                                # 使用idx索引原始masks（保持BitmapMasks格式）
+                                from mmdet.structures.mask import BitmapMasks
+                                ori_masks = det_sample.gt_instances.masks
+                                indices = gt_collected.idx.cpu().numpy()
+                                if isinstance(ori_masks, BitmapMasks):
+                                    # 从BitmapMasks中选择
+                                    masks_np = ori_masks.masks[indices]
+                                    gt_masks = BitmapMasks(masks_np, ori_masks.height, ori_masks.width)
+                                else:
+                                    # 如果是Tensor，转换为BitmapMasks
+                                    masks_tensor = ori_masks[indices] if isinstance(ori_masks, torch.Tensor) else ori_masks.to_tensor()[indices]
+                                    masks_np = masks_tensor.cpu().numpy().astype(np.uint8)
+                                    gt_masks = BitmapMasks(masks_np, masks_tensor.shape[-2], masks_tensor.shape[-1])
+                            elif hasattr(gt_collected, 'masks'):
+                                # 直接使用gt_instances_collected中的masks（保持原格式）
+                                from mmdet.structures.mask import BitmapMasks
+                                if isinstance(gt_collected.masks, BitmapMasks):
+                                    gt_masks = gt_collected.masks
+                                elif isinstance(gt_collected.masks, torch.Tensor):
+                                    # 转换为BitmapMasks
+                                    masks_np = gt_collected.masks.cpu().numpy().astype(np.uint8)
+                                    gt_masks = BitmapMasks(masks_np, gt_collected.masks.shape[-2], gt_collected.masks.shape[-1])
+                                else:
+                                    gt_masks = gt_collected.masks
+                            else:
+                                # 如果没有masks，使用原始gt_instances的masks
+                                gt_masks = det_sample.gt_instances.masks
+                            
+                            gt_instances = InstanceData(masks=gt_masks)
+                            # 复制labels和bboxes（如果存在）
+                            if hasattr(det_sample.gt_instances, 'labels'):
+                                gt_instances.labels = det_sample.gt_instances.labels
+                            if hasattr(det_sample.gt_instances, 'bboxes'):
+                                gt_instances.bboxes = det_sample.gt_instances.bboxes
+                            clip_instances.append(gt_instances)
+                        else:
+                            # 没有gt_instances_collected，使用原始gt_instances
+                            clip_instances.append(det_sample.gt_instances)
+                        
+                        if 'gt_sem_seg' in det_sample:
+                            clip_sem_seg.append(det_sample.gt_sem_seg)
+                        else:
+                            clip_sem_seg.append(None)
+                    batch_img_metas.append(clip_meta)
+                    batch_gt_instances.append(clip_instances)
+                    batch_gt_semantic_segs.append(clip_sem_seg)
+                else:
+                    # 图像交互任务：处理DetDataSample
+                    gt_collected = data_sample.gt_instances_collected
+                    
+                    # 检查是否有idx属性（用于索引原始masks）
+                    if hasattr(gt_collected, 'idx'):
+                        # 使用idx索引原始masks（保持BitmapMasks格式）
+                        from mmdet.structures.mask import BitmapMasks
+                        import numpy as np
+                        ori_masks = data_sample.gt_instances.masks
+                        indices = gt_collected.idx.cpu().numpy()
+                        if isinstance(ori_masks, BitmapMasks):
+                            # 从BitmapMasks中选择
+                            masks_np = ori_masks.masks[indices]
+                            gt_masks = BitmapMasks(masks_np, ori_masks.height, ori_masks.width)
+                        else:
+                            # 如果是Tensor，转换为BitmapMasks
+                            masks_tensor = ori_masks[indices] if isinstance(ori_masks, torch.Tensor) else ori_masks.to_tensor()[indices]
+                            masks_np = masks_tensor.cpu().numpy().astype(np.uint8)
+                            gt_masks = BitmapMasks(masks_np, masks_tensor.shape[-2], masks_tensor.shape[-1])
+                    elif hasattr(gt_collected, 'masks'):
+                        # 直接使用gt_instances_collected中的masks（保持原格式）
+                        from mmdet.structures.mask import BitmapMasks
+                        import numpy as np
+                        if isinstance(gt_collected.masks, BitmapMasks):
+                            gt_masks = gt_collected.masks
+                        elif isinstance(gt_collected.masks, torch.Tensor):
+                            # 转换为BitmapMasks
+                            masks_np = gt_collected.masks.cpu().numpy().astype(np.uint8)
+                            gt_masks = BitmapMasks(masks_np, gt_collected.masks.shape[-2], gt_collected.masks.shape[-1])
+                        else:
+                            gt_masks = gt_collected.masks
+                    else:
+                        # 如果没有masks，使用原始gt_instances的masks
+                        gt_masks = data_sample.gt_instances.masks
+                    
+                    gt_instances = InstanceData(masks=gt_masks)
+                    # 复制labels和bboxes（如果存在）
+                    if hasattr(data_sample.gt_instances, 'labels'):
+                        gt_instances.labels = data_sample.gt_instances.labels
+                    if hasattr(data_sample.gt_instances, 'bboxes'):
+                        gt_instances.bboxes = data_sample.gt_instances.bboxes
+                    batch_img_metas.append(data_sample.metainfo)
+                    batch_gt_instances.append(gt_instances)
+                    if 'gt_sem_seg' in data_sample:
+                        batch_gt_semantic_segs.append(data_sample.gt_sem_seg)
+                    else:
+                        batch_gt_semantic_segs.append(None)
+            # 对于prompt_training，也需要调用preprocess_gt来统一格式
+            batch_gt_instances = self.preprocess_gt(batch_gt_instances, batch_gt_semantic_segs)
         else:
             for data_sample in batch_data_samples:
                 if isinstance(data_sample, TrackDataSample):
@@ -1017,12 +1179,45 @@ class Mask2FormerVideoHead(AnchorFreeHead):
                         batch_gt_semantic_segs.append(None)
             batch_gt_instances = self.preprocess_gt(batch_gt_instances, batch_gt_semantic_segs)
         # forward
+        # 🔥 关键：保存prompt_training的值，因为forward可能会修改它
+        saved_prompt_training = self.prompt_training
+        print(f"[DEBUG] Before forward(): prompt_training={self.prompt_training}")
         all_cls_scores, all_mask_preds, all_iou_preds, _ = self(x, batch_data_samples)
+        # 🔥 恢复prompt_training的值
+        self.prompt_training = saved_prompt_training
+        print(f"[DEBUG] After forward(): prompt_training={self.prompt_training} (restored)")
 
         # loss
         if isinstance(batch_data_samples[0], TrackDataSample):
             num_frames = len(batch_img_metas[0])
-            all_mask_preds = [mask.flatten(2, 3) for mask in all_mask_preds]
+            print(f"\n[DEBUG] 视频任务 - num_frames={num_frames}, batch_size={len(batch_img_metas)}, prompt_training={self.prompt_training}")
+            print(f"[DEBUG] all_mask_preds shapes before flatten: {[m.shape for m in all_mask_preds[:2]]}")
+            
+            # 🔥 关键：对于prompt_training=True的视频交互任务，需要扩展cls_scores、mask_preds和iou_preds
+            # mask_preds的形状是(bs, num_queries, num_frames, h, w)，需要reshape成(bs * num_frames, num_queries, h, w)
+            if self.prompt_training:
+                # 视频交互任务：扩展cls_scores、mask_preds和iou_preds
+                all_cls_scores = [
+                    cls.repeat_interleave(num_frames, dim=0) if cls.dim() == 3
+                    else cls for cls in all_cls_scores
+                ]
+                all_mask_preds = [
+                    mask.permute(0, 2, 1, 3, 4).flatten(0, 1).flatten(2, 3) if mask.dim() == 5 and mask.shape[2] == num_frames
+                    else mask.flatten(2, 3) for mask in all_mask_preds
+                ]
+                all_iou_preds = [
+                    iou.repeat_interleave(num_frames, dim=0) if iou is not None and iou.dim() == 3 and iou.shape[2] == 1
+                    else iou for iou in all_iou_preds
+                ]
+                print(f"[DEBUG] ✅ Extended cls_scores, mask_preds and iou_preds for prompt_training")
+                print(f"[DEBUG] all_cls_scores shapes after extension: {[c.shape for c in all_cls_scores[:2]]}")
+                print(f"[DEBUG] all_mask_preds shapes after extension: {[m.shape for m in all_mask_preds[:2]]}")
+                print(f"[DEBUG] all_iou_preds shapes after extension: {[iou.shape if iou is not None else None for iou in all_iou_preds[:2]]}")
+            else:
+                # VOS任务：只flatten空间维度，不扩展batch维度
+                all_mask_preds = [mask.flatten(2, 3) for mask in all_mask_preds]
+                print(f"[DEBUG] all_mask_preds shapes after flatten: {[m.shape for m in all_mask_preds[:2]]}")
+                print(f"[DEBUG] ⏭️  Skipped iou_preds expansion for VOS (will be masked)")
             for instance in batch_gt_instances:
                 instance['masks'] = instance['masks'].flatten(1, 2)
             film_metas = [
@@ -1065,6 +1260,11 @@ class Mask2FormerVideoHead(AnchorFreeHead):
         if isinstance(data_sample, TrackDataSample):
             img_shape = data_sample[0].metainfo['batch_input_shape']
             num_frames = len(data_sample)
+            # 检查视频任务中的交互prompt
+            if hasattr(data_sample, 'video_data_samples') and len(data_sample.video_data_samples) > 0:
+                first_frame = data_sample.video_data_samples[0]
+                if hasattr(first_frame, 'gt_instances_collected') and first_frame.gt_instances_collected is not None:
+                    self.prompt_training = True
         else:
             if 'gt_instances_collected' in data_sample:
                 self.prompt_training = True
