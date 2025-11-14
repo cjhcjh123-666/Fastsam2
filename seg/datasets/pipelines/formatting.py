@@ -309,3 +309,45 @@ class GeneratePoint(BaseTransform):
         return results
 
 
+@TRANSFORMS.register_module()
+class GenerateText(BaseTransform):
+    """Generate text prompts from metainfo, similar to GeneratePoint.
+    
+    If text exists in metainfo (e.g., from RefCOCO), use it.
+    Otherwise, generate text from class labels.
+    """
+    def __init__(self, use_class_names=False):
+        self.use_class_names = use_class_names
+    
+    def transform(self, results):
+        data_samples = results['data_samples']
+        gt_instances = data_samples.gt_instances
+        
+        # 从 metainfo 中获取文本（RefCOCO数据集会提供）
+        text = data_samples.metainfo.get('text', None)
+        
+        # 如果没有文本，从类别名称生成（可选）
+        if text is None and self.use_class_names:
+            # 从类别ID生成文本描述
+            if hasattr(gt_instances, 'labels') and len(gt_instances.labels) > 0:
+                # 这里可以添加类别到文本的映射
+                text = "object"  # 默认文本
+        
+        # 将文本添加到 gt_instances_collected（如果已存在）或创建新的
+        if not hasattr(data_samples, 'gt_instances_collected'):
+            data_samples.gt_instances_collected = InstanceData()
+        
+        # 为每个实例存储文本（如果有多个实例，使用相同的文本或生成多个）
+        num_instances = len(gt_instances) if hasattr(gt_instances, '__len__') else 1
+        if text is not None:
+            # 存储文本字符串列表（每个prompt对应一个文本）
+            if not hasattr(data_samples.gt_instances_collected, 'text'):
+                data_samples.gt_instances_collected.text = []
+            # 为每个prompt添加文本（与point_coords的数量对应）
+            if hasattr(data_samples.gt_instances_collected, 'point_coords'):
+                num_prompts = len(data_samples.gt_instances_collected.point_coords)
+                data_samples.gt_instances_collected.text = [text] * num_prompts
+            else:
+                data_samples.gt_instances_collected.text = [text] * num_instances
+        
+        return results
