@@ -92,20 +92,20 @@ class RapSAM(Mask2formerVideo):
             self.task_router = None
         
         self.use_streaming_memory = use_streaming_memory
+        # Note: StreamingMemory and PromptFusion are built in panoptic_head
+        # The detector-level instances are kept for reference but not used directly
+        # All modules should be registered in panoptic_head to ensure proper device handling
         if use_streaming_memory:
             if streaming_memory is None:
                 streaming_memory = dict(type='StreamingMemoryAdapter')
-            self.streaming_memory = MODELS.build(streaming_memory)
+            # Don't build here - it's built in head
+            self.streaming_memory = None
         else:
             self.streaming_memory = None
         
         self.use_prompt_fusion = use_prompt_fusion
-        if use_prompt_fusion:
-            if prompt_fusion is None:
-                prompt_fusion = dict(type='PromptFusion')
-            self.prompt_fusion = MODELS.build(prompt_fusion)
-        else:
-            self.prompt_fusion = None
+        # Don't build here - it's built in head
+        self.prompt_fusion = None
     
     def loss(self, batch_inputs: torch.Tensor,
              batch_data_samples: SampleList) -> Dict[str, torch.Tensor]:

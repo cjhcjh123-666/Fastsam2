@@ -237,8 +237,8 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         all_iou_preds = []
         
         # Apply prompt fusion if enabled and routing config indicates interactive task
-        # IMPORTANT: Always call prompt_fusion_module to ensure all parameters participate in gradient computation
-        # This prevents DDP errors when some batches don't have prompts
+        # Note: With find_unused_parameters=True in DDP config, it's safe to skip calling
+        # prompt_fusion_module when there are no prompts
         fused_prompts = None
         if self.use_prompt_fusion and self.prompt_fusion_module is not None:
             if self.routing_config:
@@ -252,27 +252,19 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                 batch_data_samples, batch_img_metas
             )
             
-            # Always call prompt_fusion_module, even if no prompts
-            # This ensures TextEncoder and other parameters always participate in computation
-            # Use zero embeddings as dummy input if no prompts available
-            device = x[0].device
-            if point_embed is None and box_embed is None and text_embed is None and text_tokens is None:
-                # Create dummy zero embeddings to ensure gradient flow
-                # This ensures all parameters in prompt_fusion_module are used
-                dummy_embed = torch.zeros((bs, 1, self.feat_channels), device=device, requires_grad=False)
-                # Call with dummy input - this ensures all parameters are used
-                # The dummy input will be processed but won't affect the output
-                fused_prompts = self.prompt_fusion_module(
-                    point_embed=dummy_embed,  # Dummy input to ensure computation
-                    box_embed=None,
-                    text=None,
-                    text_embed=None
-                )
-                # Set to None after computation to avoid affecting kernels
-                # But the computation itself ensures gradient flow
-                fused_prompts = None
-            else:
-                # Normal case: fuse actual prompts
+            # Only call prompt_fusion_module if we have actual prompts
+            # DDP unused parameters are handled by find_unused_parameters=True in config
+            if point_embed is not None or box_embed is not None or text_embed is not None or text_tokens is not None:
+                # Ensure all embeddings are on the same device as the model
+                device = x[0].device if isinstance(x, (list, tuple)) else x.device
+                if point_embed is not None:
+                    point_embed = point_embed.to(device)
+                if box_embed is not None:
+                    box_embed = box_embed.to(device)
+                if text_embed is not None:
+                    text_embed = text_embed.to(device)
+                
+                # Fuse actual prompts
                 fused_prompts = self.prompt_fusion_module(
                     point_embed=point_embed,
                     box_embed=box_embed,
@@ -616,6 +608,11 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
             cls_scores = cls_scores.flatten(0, 1)
             labels = labels.flatten(0, 1)
             label_weights = label_weights.flatten(0, 1)
+            
+            # Ensure labels and label_weights are on the same device as cls_scores
+            labels = labels.to(cls_scores.device)
+            label_weights = label_weights.to(cls_scores.device)
+            
             class_weight = cls_scores.new_tensor(self.class_weight)
             ignore_inds = labels.eq(-1.)
             # zero will not be involved in the loss cal
@@ -636,6 +633,10 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
             # extract positive ones
             # shape (batch_size, num_queries, h, w) -> (num_total_gts, h, w)
             mask_preds = mask_preds[mask_weights > 0]
+            
+            # Ensure mask_targets are on the same device as mask_preds
+            if mask_targets.shape[0] > 0:
+                mask_targets = mask_targets.to(mask_preds.device)
 
             if mask_targets.shape[0] == 0:
                 # zero match

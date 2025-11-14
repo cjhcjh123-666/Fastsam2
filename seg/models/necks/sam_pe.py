@@ -85,8 +85,9 @@ class SAMPromptEncoder(BaseModule):
         bboxes = bboxes + 0.5  # Shift to center of pixel
         coords = bboxes.reshape(-1, 2, 2)
         corner_embedding = self.pe_layer.forward_with_coords(coords, image_size)
-        corner_embedding[:, 0, :] += self.point_embeddings[2].weight
-        corner_embedding[:, 1, :] += self.point_embeddings[3].weight
+        # Ensure embeddings are on the same device
+        corner_embedding[:, 0, :] += self.point_embeddings[2].weight.to(corner_embedding.device)
+        corner_embedding[:, 1, :] += self.point_embeddings[3].weight.to(corner_embedding.device)
         return corner_embedding
 
     def _embed_masks(self, masks: torch.Tensor) -> torch.Tensor:
@@ -112,9 +113,10 @@ class SAMPromptEncoder(BaseModule):
             labels = torch.cat([labels, padding_label], dim=1)
         point_embedding = self.pe_layer.forward_with_coords(points, self.input_image_size)
         point_embedding[labels == -1] = 0.0
-        point_embedding[labels == -1] += self.not_a_point_embed.weight
-        point_embedding[labels == 0] += self.point_embeddings[0].weight
-        point_embedding[labels == 1] += self.point_embeddings[1].weight
+        # Ensure embeddings are on the same device
+        point_embedding[labels == -1] += self.not_a_point_embed.weight.to(point_embedding.device)
+        point_embedding[labels == 0] += self.point_embeddings[0].weight.to(point_embedding.device)
+        point_embedding[labels == 1] += self.point_embeddings[1].weight.to(point_embedding.device)
         return point_embedding
 
     def forward(
@@ -127,7 +129,16 @@ class SAMPromptEncoder(BaseModule):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert with_points or with_bboxes or with_masks
         bs = len(instances)
-        sparse_embeddings = torch.empty((bs, 0, self.embed_dim), device=self.device)
+        
+        # Determine device from input data
+        if with_points and 'point_coords' in instances:
+            device = instances.point_coords.device
+        elif with_bboxes and 'bboxes' in instances:
+            device = instances.bboxes.device
+        else:
+            device = self.device
+        
+        sparse_embeddings = torch.empty((bs, 0, self.embed_dim), device=device)
         if with_points:
             assert 'point_coords' in instances
             coords = instances.point_coords
@@ -146,7 +157,8 @@ class SAMPromptEncoder(BaseModule):
             assert 'masks' in instances
             dense_embeddings = self._embed_masks(instances.masks.masks)
         else:
-            dense_embeddings = self.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
+            # Ensure no_mask_embed is on the correct device
+            dense_embeddings = self.no_mask_embed.weight.to(device).reshape(1, -1, 1, 1).expand(
                 bs, -1, self.image_embedding_size[0], self.image_embedding_size[1]
             )
         return sparse_embeddings, dense_embeddings

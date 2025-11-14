@@ -437,7 +437,17 @@ class Mask2FormerVideoHead(AnchorFreeHead):
         mask_points_pred = point_sample(mask_pred.unsqueeze(1),
                                         point_coords.repeat(num_queries, 1, 1)).squeeze(1)
         # shape (num_gts, num_points)
-        gt_points_masks = point_sample(gt_masks.unsqueeze(1).float(),
+        # Ensure gt_masks is a tensor on the correct device
+        if hasattr(gt_masks, 'to_tensor'):
+            # BitmapMasks or PolygonMasks object
+            gt_masks_tensor = gt_masks.to_tensor(dtype=torch.float32, device=cls_score.device)
+        elif isinstance(gt_masks, torch.Tensor):
+            gt_masks_tensor = gt_masks.to(dtype=torch.float32, device=cls_score.device)
+        else:
+            # Fallback: try to convert
+            gt_masks_tensor = torch.tensor(gt_masks, dtype=torch.float32, device=cls_score.device)
+        
+        gt_points_masks = point_sample(gt_masks_tensor.unsqueeze(1),
                                         point_coords.repeat(num_gts, 1, 1)).squeeze(1)
 
         sampled_gt_instances = InstanceData(
