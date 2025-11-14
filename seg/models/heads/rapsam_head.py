@@ -177,6 +177,9 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         self.loss_mask = MODELS.build(loss_mask)
         self.loss_dice = MODELS.build(loss_dice)
         
+        # Initialize prompt_training attribute
+        # It will be set dynamically in forward() and loss() based on data samples
+        self.prompt_training = False
 
     def init_weights(self) -> None:
         pass
@@ -196,6 +199,25 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                 pass
     
     def forward(self, x, batch_data_samples: SampleList) -> Tuple[List[Tensor]]:
+        # Set prompt_training mode based on data_tag or gt_instances_collected
+        # This needs to be set before using it in the forward pass
+        if batch_data_samples and len(batch_data_samples) > 0:
+            first_sample = batch_data_samples[0]
+            # Check data_tag attribute
+            if hasattr(first_sample, 'get') and first_sample.get('data_tag', 'coco') == 'sam':
+                self.prompt_training = True
+            elif hasattr(first_sample, 'data_tag') and first_sample.data_tag == 'sam':
+                self.prompt_training = True
+            else:
+                # Check if gt_instances_collected exists (indicates prompt training)
+                has_gt_collected = any(
+                    hasattr(ds, 'gt_instances_collected') and ds.gt_instances_collected is not None
+                    for ds in batch_data_samples
+                )
+                self.prompt_training = has_gt_collected
+        else:
+            self.prompt_training = False
+        
         batch_img_metas = []
         if isinstance(batch_data_samples[0], TrackDataSample):
             for track_sample in batch_data_samples:
