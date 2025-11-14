@@ -335,11 +335,44 @@ class RapSAM(Mask2formerVideo):
         valid_indices = []
         for idx, text in enumerate(text_list):
             if text is not None:
-                # Encode text (text can be a string or list of strings)
-                if isinstance(text, str):
+                # Convert text to string if it's a Tensor or other type
+                if isinstance(text, torch.Tensor):
+                    # If text is a tensor, convert to string
+                    # Handle different tensor shapes
+                    if text.dim() == 0:
+                        # Scalar tensor
+                        text = str(text.item())
+                    elif text.dim() == 1:
+                        # 1D tensor, try to convert to string
+                        text = str(text.tolist())
+                    else:
+                        # Skip if tensor shape is not supported
+                        continue
+                elif not isinstance(text, str):
+                    # Try to convert to string
+                    try:
+                        text = str(text)
+                    except Exception:
+                        continue
+                
+                # Encode text (text should now be a string)
+                if isinstance(text, str) and len(text.strip()) > 0:
                     text_embed = text_encoder([text])  # TextEncoder expects list
                 elif isinstance(text, list):
-                    text_embed = text_encoder(text)
+                    # Ensure all items in list are strings
+                    text_list_clean = []
+                    for t in text:
+                        if isinstance(t, torch.Tensor):
+                            if t.dim() == 0:
+                                text_list_clean.append(str(t.item()))
+                            else:
+                                continue
+                        elif isinstance(t, str):
+                            text_list_clean.append(t)
+                    if text_list_clean:
+                        text_embed = text_encoder(text_list_clean)
+                    else:
+                        continue
                 else:
                     continue
                 
