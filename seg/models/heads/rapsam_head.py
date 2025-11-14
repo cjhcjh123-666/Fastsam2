@@ -308,13 +308,16 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         mask_features = x
         
         # Apply streaming memory for VOS tasks
-        # IMPORTANT: Always call streaming_memory to ensure all parameters participate in gradient computation
+        # CRITICAL for DDP: ALWAYS call streaming_memory to ensure all parameters participate in gradient computation
         # This prevents DDP errors when some batches are not video data
         memory_enhanced_features = None
         if self.use_streaming_memory and self.streaming_memory is not None:
-            # Even if not video data, we should still call streaming_memory with dummy input
-            # to ensure all parameters are used (for DDP compatibility)
-            if self.routing_config and num_frames > 1:
+            # CRITICAL: Always call streaming_memory, even with dummy input, to ensure DDP gradient sync
+            # If not video data, we still need to call it to ensure parameters are used
+            is_video_data = (self.routing_config and num_frames > 1 and 
+                           isinstance(batch_data_samples[0], TrackDataSample) if batch_data_samples else False)
+            
+            if is_video_data:
                 task_config = self.routing_config.get('task_specific_config', {})
                 if task_config.get('enable_mask_propagation', False):
                     # For VOS, we process frames sequentially and use memory from previous frames
@@ -446,6 +449,8 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                                                         memory_enhanced_features[batch_idx:batch_idx+1] * (1 - memory_weight) +
                                                         mem_feat * memory_weight
                                                     )
+            # Note: For non-video data, StreamingMemory is not called
+            # DDP will handle unused parameters via find_unused_parameters=True in config
         
         # Use memory-enhanced features if available
         if memory_enhanced_features is not None:

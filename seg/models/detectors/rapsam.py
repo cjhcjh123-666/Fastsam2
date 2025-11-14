@@ -159,23 +159,34 @@ class RapSAM(Mask2formerVideo):
         # This prevents "Expected to have finished reduction in the prior iteration" errors
         # The dummy loss has coefficient 0.0, so it doesn't affect training
         if self.training:
-            dummy_loss = 0.0
+            # Initialize dummy_loss as a tensor to ensure gradient flow
+            # Get device from any existing loss tensor
+            device = next(iter(losses.values())).device if losses else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            dummy_loss = torch.tensor(0.0, device=device, requires_grad=True)
             
-            # Ensure TextEncoder parameters have gradients (used only with RefCOCO data)
+            # Ensure PromptFusion module parameters have gradients (including TextEncoder)
             if hasattr(self.panoptic_head, 'prompt_fusion_module'):
                 prompt_fusion = self.panoptic_head.prompt_fusion_module
-                if prompt_fusion is not None and hasattr(prompt_fusion, 'text_encoder'):
-                    text_encoder = prompt_fusion.text_encoder
-                    if text_encoder is not None:
-                        for param in text_encoder.parameters():
-                            if param.requires_grad:
-                                dummy_loss = dummy_loss + 0.0 * param.sum()
+                if prompt_fusion is not None:
+                    # Access all parameters in PromptFusion (including TextEncoder, cross_attn, etc.)
+                    for param in prompt_fusion.parameters():
+                        if param.requires_grad:
+                            dummy_loss = dummy_loss + 0.0 * param.sum()
             
             # Ensure StreamingMemory parameters have gradients (used only with video data)
             if hasattr(self.panoptic_head, 'streaming_memory'):
                 streaming_memory = self.panoptic_head.streaming_memory
                 if streaming_memory is not None:
                     for param in streaming_memory.parameters():
+                        if param.requires_grad:
+                            dummy_loss = dummy_loss + 0.0 * param.sum()
+            
+            # Also ensure any other conditional modules have gradients
+            # Check for any other modules that might be conditionally used
+            if hasattr(self.panoptic_head, 'prompt_encoder'):
+                prompt_encoder = self.panoptic_head.prompt_encoder
+                if prompt_encoder is not None:
+                    for param in prompt_encoder.parameters():
                         if param.requires_grad:
                             dummy_loss = dummy_loss + 0.0 * param.sum()
             
