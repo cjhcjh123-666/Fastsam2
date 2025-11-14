@@ -529,10 +529,7 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
             # 🔥 关键：mask_weights需要扩展到(num_imgs, num_queries)的形状
             # 在视频任务中，num_imgs = batch_size * num_frames
             # 直接基于num_imgs创建mask_weights，确保形状匹配
-            print(f"[DEBUG _loss_by_feat_single] num_imgs={num_imgs}, batch_size={batch_size}, num_ins={num_ins}")
-            print(f"[DEBUG _loss_by_feat_single] mask_preds.shape={mask_preds.shape}, iou_preds.shape={iou_preds.shape if iou_preds is not None else None}")
             mask_weights = mask_targets.new_ones((num_imgs, num_ins), dtype=torch.float)  # (num_imgs, num_queries)
-            print(f"[DEBUG _loss_by_feat_single] mask_weights.shape={mask_weights.shape}")
             avg_factor = cls_scores.size(1)
 
             num_total_masks = reduce_mean(cls_scores.new_tensor([avg_factor]))
@@ -541,7 +538,6 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
             # 🔥 关键：对iou_preds应用与mask_preds相同的过滤
             # mask_weights的形状现在是(num_imgs, num_queries)，需要flatten成(num_imgs * num_queries,)
             mask_weights_flat = mask_weights.flatten()  # (num_imgs * num_queries,)
-            print(f"[DEBUG _loss_by_feat_single] mask_weights_flat.shape={mask_weights_flat.shape}")
             # iou_preds的形状可能是(num_imgs, num_queries, 1)或(num_imgs, num_queries)
             if iou_preds is not None:
                 if iou_preds.dim() == 3:
@@ -550,7 +546,6 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                         iou_preds_flat = iou_preds_flat.squeeze(1)  # (num_imgs * num_queries,)
                 else:
                     iou_preds_flat = iou_preds.flatten()  # (num_imgs * num_queries,)
-                print(f"[DEBUG _loss_by_feat_single] iou_preds_flat.shape={iou_preds_flat.shape}")
                 # 应用mask_weights过滤
                 iou_preds = iou_preds_flat[mask_weights_flat > 0]  # (num_valid_masks,)
             else:
@@ -611,10 +606,8 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                 # 我们需要为每个mask生成点坐标，所以使用第一个query: (num_masks, 1, h, w)
                 if mask_preds_2d.dim() == 4:
                     mask_preds_for_coords = mask_preds_2d[:, 0:1, :, :]  # (num_masks, 1, h, w)
-                    print(f"[DEBUG] mask_preds_2d.shape={mask_preds_2d.shape}, mask_preds_for_coords.shape={mask_preds_for_coords.shape}")
                 else:
                     mask_preds_for_coords = mask_preds_2d.unsqueeze(1)
-                    print(f"[DEBUG] mask_preds_2d.dim()={mask_preds_2d.dim()}, mask_preds_for_coords.shape={mask_preds_for_coords.shape}")
                 
                 # 🔥 关键：get_uncertain_point_coords_with_randomness期望输入是(N, C, H, W)
                 # 但mask_preds_for_coords是(num_masks, 1, h, w)，需要确保形状正确
@@ -625,11 +618,9 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                     # 如果是(num_masks, h, w)，需要添加channel维度
                     mask_preds_for_coords = mask_preds_for_coords.unsqueeze(1)
                 
-                print(f"[DEBUG] Before get_uncertain_point_coords: mask_preds_for_coords.shape={mask_preds_for_coords.shape}, num_points={self.num_points}")
                 points_coords = get_uncertain_point_coords_with_randomness(
                     mask_preds_for_coords, None, self.num_points,
                     self.oversample_ratio, self.importance_sample_ratio)
-                print(f"[DEBUG] After get_uncertain_point_coords: points_coords.shape={points_coords.shape}")
                 
                 # Fix batch size mismatch: mask_targets may have fewer masks than mask_preds
                 # In prompt training, each query should correspond to a mask target

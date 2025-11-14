@@ -574,13 +574,10 @@ class Mask2FormerVideoHead(AnchorFreeHead):
         """
         batch_size, num_ins = cls_scores.size(0), cls_scores.size(1)
         if self.prompt_training:
-            print(f"\n[DEBUG _loss_by_feat_single] prompt_training=True")
-            print(f"[DEBUG] cls_scores.shape={cls_scores.shape}, mask_preds.shape={mask_preds.shape}, iou_preds.shape={iou_preds.shape if iou_preds is not None else None}")
             num_imgs = mask_preds.size(0)
             cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
             mask_preds_list = [mask_preds[i] for i in range(num_imgs)]
             mask_targets = torch.cat([item.masks for item in batch_gt_instances])
-            print(f"[DEBUG] mask_targets.shape={mask_targets.shape}")
             mask_weights = mask_targets.new_ones((batch_size, num_ins), dtype=torch.float)
             avg_factor = cls_scores.size(1)
 
@@ -588,7 +585,6 @@ class Mask2FormerVideoHead(AnchorFreeHead):
             num_total_masks = max(num_total_masks, 1)
 
             mask_preds = mask_preds[mask_weights > 0]
-            print(f"[DEBUG] mask_preds after filtering shape={mask_preds.shape}")
 
             if mask_targets.shape[0] == 0:
                 # zero match
@@ -624,40 +620,30 @@ class Mask2FormerVideoHead(AnchorFreeHead):
                                     reduction_override='none')
 
             # 处理iou_preds：确保形状正确
-            print(f"[DEBUG] Before iou processing: iou_preds.shape={iou_preds.shape if iou_preds is not None else None}, loss_dice.shape={loss_dice.shape}")
             if iou_preds is not None:
                 # iou_preds的形状可能是 (bs, num_queries, 1) 或 (bs, num_queries, num_frames, 1)
                 # 需要flatten到 (bs * num_queries,) 或 (bs * num_queries * num_frames,)
-                original_shape = iou_preds.shape
                 if iou_preds.dim() > 2:
                     # 如果是3D或4D，flatten所有维度除了batch
                     iou_preds = iou_preds.flatten(1)  # (bs, num_queries, ...) -> (bs, num_queries * ...)
-                    print(f"[DEBUG] After flatten(1): {original_shape} -> {iou_preds.shape}")
                 iou_preds = iou_preds.flatten()  # (bs, num_queries * ...) -> (bs * num_queries * ...)
-                print(f"[DEBUG] After final flatten: -> {iou_preds.shape}")
                 
                 # 确保iou_preds和iou_target的形状匹配
                 iou_target = 1 - (loss_dice / self.loss_dice.loss_weight)
-                print(f"[DEBUG] iou_target.shape={iou_target.shape}, iou_preds.numel()={iou_preds.numel()}, loss_dice.numel()={loss_dice.numel()}")
                 # loss_dice的形状是 (num_masks,)，需要扩展到与iou_preds匹配
                 if iou_preds.numel() != loss_dice.numel():
                     # 如果形状不匹配，需要调整
                     # 通常iou_preds应该和mask_preds的数量一致
                     num_masks = mask_preds.shape[0]  # mask_preds已经通过mask_weights > 0过滤
-                    print(f"[DEBUG] Shape mismatch! num_masks={num_masks}, iou_preds.numel()={iou_preds.numel()}, loss_dice.numel()={loss_dice.numel()}")
                     if iou_preds.numel() >= num_masks:
                         iou_preds = iou_preds[:num_masks]
-                        print(f"[DEBUG] Truncated iou_preds to {iou_preds.shape}")
                     else:
                         # 如果iou_preds数量不够，需要扩展
                         device = iou_preds.device
                         iou_preds = torch.cat([iou_preds, torch.zeros(num_masks - iou_preds.numel(), device=device)])
-                        print(f"[DEBUG] Extended iou_preds to {iou_preds.shape}")
                 
                 loss_iou = F.mse_loss(iou_preds, iou_target, reduction="none")
-                print(f"[DEBUG] loss_iou before sum: shape={loss_iou.shape}, mean={loss_iou.mean().item():.6f}, sum={loss_iou.sum().item():.6f}")
             else:
-                print(f"[DEBUG] iou_preds is None! Creating zero loss")
                 # 如果iou_preds是None，创建零loss但保持梯度流
                 device = mask_preds.device
                 loss_iou = torch.tensor(0.0, device=device, requires_grad=True)
@@ -1023,25 +1009,17 @@ class Mask2FormerVideoHead(AnchorFreeHead):
         first_sample = batch_data_samples[0]
         has_prompt = False
         
-        print(f"\n[DEBUG loss()] Checking prompt_training:")
-        print(f"[DEBUG] first_sample type: {type(first_sample).__name__}")
-        
         if isinstance(first_sample, TrackDataSample):
             # 视频交互任务：检查video_data_samples中的第一帧
-            print(f"[DEBUG] TrackDataSample detected")
             if hasattr(first_sample, 'video_data_samples') and len(first_sample.video_data_samples) > 0:
                 first_frame = first_sample.video_data_samples[0]
-                print(f"[DEBUG] first_frame has gt_instances_collected: {hasattr(first_frame, 'gt_instances_collected')}")
                 if hasattr(first_frame, 'gt_instances_collected') and first_frame.gt_instances_collected is not None:
                     has_prompt = True
-                    print(f"[DEBUG] ✅ Video interactive task detected (has gt_instances_collected)")
         elif hasattr(first_sample, 'gt_instances_collected') and first_sample.gt_instances_collected is not None:
             # 图像交互任务 (SAM, RefCOCO等)
             has_prompt = True
-            print(f"[DEBUG] ✅ Image interactive task detected (has gt_instances_collected)")
         
         self.prompt_training = has_prompt
-        print(f"[DEBUG] prompt_training = {self.prompt_training}")
 
         if self.prompt_training:
             for data_sample in batch_data_samples:
@@ -1181,17 +1159,13 @@ class Mask2FormerVideoHead(AnchorFreeHead):
         # forward
         # 🔥 关键：保存prompt_training的值，因为forward可能会修改它
         saved_prompt_training = self.prompt_training
-        print(f"[DEBUG] Before forward(): prompt_training={self.prompt_training}")
         all_cls_scores, all_mask_preds, all_iou_preds, _ = self(x, batch_data_samples)
         # 🔥 恢复prompt_training的值
         self.prompt_training = saved_prompt_training
-        print(f"[DEBUG] After forward(): prompt_training={self.prompt_training} (restored)")
 
         # loss
         if isinstance(batch_data_samples[0], TrackDataSample):
             num_frames = len(batch_img_metas[0])
-            print(f"\n[DEBUG] 视频任务 - num_frames={num_frames}, batch_size={len(batch_img_metas)}, prompt_training={self.prompt_training}")
-            print(f"[DEBUG] all_mask_preds shapes before flatten: {[m.shape for m in all_mask_preds[:2]]}")
             
             # 🔥 关键：对于prompt_training=True的视频交互任务，需要扩展cls_scores、mask_preds和iou_preds
             # mask_preds的形状是(bs, num_queries, num_frames, h, w)，需要reshape成(bs * num_frames, num_queries, h, w)
@@ -1209,15 +1183,9 @@ class Mask2FormerVideoHead(AnchorFreeHead):
                     iou.repeat_interleave(num_frames, dim=0) if iou is not None and iou.dim() == 3 and iou.shape[2] == 1
                     else iou for iou in all_iou_preds
                 ]
-                print(f"[DEBUG] ✅ Extended cls_scores, mask_preds and iou_preds for prompt_training")
-                print(f"[DEBUG] all_cls_scores shapes after extension: {[c.shape for c in all_cls_scores[:2]]}")
-                print(f"[DEBUG] all_mask_preds shapes after extension: {[m.shape for m in all_mask_preds[:2]]}")
-                print(f"[DEBUG] all_iou_preds shapes after extension: {[iou.shape if iou is not None else None for iou in all_iou_preds[:2]]}")
             else:
                 # VOS任务：只flatten空间维度，不扩展batch维度
                 all_mask_preds = [mask.flatten(2, 3) for mask in all_mask_preds]
-                print(f"[DEBUG] all_mask_preds shapes after flatten: {[m.shape for m in all_mask_preds[:2]]}")
-                print(f"[DEBUG] ⏭️  Skipped iou_preds expansion for VOS (will be masked)")
             for instance in batch_gt_instances:
                 instance['masks'] = instance['masks'].flatten(1, 2)
             film_metas = [
