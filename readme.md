@@ -1,189 +1,475 @@
-## FastSAM2 多任务实时分割方案
-# export HF_ENDPOINT=https://hf-mirror.com
-# ps aux | grep rap_sam_fuxian| grep -v grep | awk '{print $2}' | xargs -r kill -9
-### 1. 项目目标
-- 构建统一的 FastSAM2 框架，覆盖图像/视频交互分割（点、框、文本）、视频对象分割（VOS）、全景分割。
-- 在 8×RTX 3090 / 8×RTX 4090（24 GB）集群上实现实时推理（1080p 输入 ≥ 25 FPS），整体性能超越 SAM / SAM2。
-- 完成 SAM2 → FastSAM2 的蒸馏训练，兼顾精度与效率。
+# FastSAM2 / RapSAM
 
-### 2. 现有基础概述
-| 模块 | 现状 | 需改进点 |
-| --- | --- | --- |
-| `seg/models/backbones/OpenCLIPBackbone` | CLIP 视觉分支，支持 ConvNeXt/ResNet；固定参数或全量训练 | 扩展双路径结构、引入 token pruning、支持蒸馏特征对齐 |
-| `seg/models/necks/YOSONeck` | Lite deform FPN + 坐标编码 | 增加 mask 状态 refinement，兼容多任务输出 |
-| `seg/models/heads/RapSAMVideoHead` | 多阶段 query 更新 + prompt/panoptic adaptor | 重构为多模态 TaskRouter、引入 Streaming Memory、低秩注意力 |
-| `seg/models/detectors/RapSAM`/`Mask2formerVideo` | 统一 panoptic/instance 逻辑 | 支持多任务切换、VOS 专用流程、实时路径 |
-| 数据 & 评估 | 支持 COCO、YouTube-VIS、交互评估器 | 融合 DAVIS、补齐 VOS 指标、扩展实时评测 |
+一个统一的多任务实时分割框架，支持图像/视频交互分割、视频对象分割（VOS）和全景分割。
 
-### 3. 硬件与数据
-- **硬件**：8×RTX 3090、8×RTX 4090；建议分集群训练，混集群时注意 NCCL 参数。
-- **数据集**：
-  - COCO（图像交互 + 全景）；
-  - YouTube-VIS 2019（视频交互 + VOS）；
-  - DAVIS 2017/2019（高质量 VOS）。
-- **蒸馏教师**：SAM2 官方模型（需准备推理脚本和权重）。
+## 📋 目录
 
-### 4. 创新点设计
+- [特性](#特性)
+- [支持的模型和任务](#支持的模型和任务)
+- [安装](#安装)
+- [数据集准备](#数据集准备)
+- [快速开始](#快速开始)
+- [训练](#训练)
+- [推理](#推理)
+- [项目结构](#项目结构)
+- [配置说明](#配置说明)
+- [常见问题](#常见问题)
+- [引用](#引用)
 
-#### 4.1 改进骨干：双路径 Token Fusion + 动态裁剪
-1. **结构**：
-   - 在 `OpenCLIPBackbone` 新增几何轻量分支（MobileSAM 结构）：`geom_branch` 对高分辨率 feature map 做深度可分卷积提取边缘/轮廓。
-   - 引入 `TokenFusionModule`：将 CLIP 语义 token 与几何 token 做 cross-attn 融合，输出语义增强特征。
-2. **动态 token 策略**：
-   - 在 `forward_func` 中添加 `TokenPruner`（基于注意力熵或显著性评分）：
-     ```pseudo
-     attn = compute_self_attention(x)
-     keep_mask = topk(attn_entropy, ratio)
-     x = x[keep_mask]
-     ```
-   - 视频模式下缓存前帧 token 分布，实现帧间共享。
-3. **蒸馏接口**：
-   - 新建 `backbones/distill_utils.py`，封装 SAM2 视觉 token 的投影对齐（L2 + Cosine）。
-   - 训练脚本中提供 `--distill-weight` 控制损失权重。
+## ✨ 特性
 
-#### 4.2 多任务轻量化结构：TaskRouter + Streaming Memory
-1. **TaskRouter**（新增 `seg/models/utils/task_router.py`）：
-   - 输入 prompt 类型（point/box/text/none）、视频长度、模式（interactive/vos/panoptic）。
-   - 输出：解码器阶段数、激活 query 子集、是否启用 streaming memory。
-2. **Streaming Memory Adapter**（新增 `seg/models/utils/memory_adapter.py`）：
-   - 维护长期/短期 memory：`long_mem`（关键帧）、`short_mem`（最近帧）。
-   - 提供接口 `update(frame_id, instance_embed, mask)` 与 `fetch(frame_id)`。
-3. **RapSAMVideoHead 重构**：
-   - 解耦 prompt adaptor 与 panoptic adaptor，按任务分别实例化。
-   - 替换多头注意力为低秩近似（Nyström / Linformer）：
-     ```python
-     class LowRankMHSA(nn.Module):
-         def forward(self, q, k, v):
-             k_proj = self.k_proj(k)  # r << d
-             v_proj = self.v_proj(v)
-             attn = softmax(q @ k_proj.T / sqrt(d))
-             return attn @ v_proj
-     ```
-   - 新增 `MaskStateRefiner`（小卷积网络）接在 `YOSONeck` 输出之后，快速修补边界，减少 transformer 负担。
-4. **VOS 适配**：
-   - 结合 memory adapter，实现 mask propagation；
-   - 引入 `Dual-Path Self-Refinement (DPSR)`：上一帧 mask 与当前预测互监督（MSE+Dice），增强时序一致性。
+### 核心功能
 
-#### 4.3 多模态交互增强：Cross-Prompt Fusion + 语言引导记忆
-1. **Cross-Prompt Fusion**：
-   - `SAMPromptEncoder` 输出点/框/掩码 embedding；
-   - `OpenCLIPBackbone.get_text_model()` 输出文本 embedding；
-   - 新增模块 `PromptFusion`（`seg/models/utils/prompt_fusion.py`）：
-     ```python
-     concat = torch.cat([point_embed, box_embed, text_embed], dim=1)
-     fused = transformer_layer(concat)
-     ```
-   - 训练时加入文本-视觉多任务损失（对齐文本 prompt 与 mask 类别）。
-2. **语言引导记忆**：
-   - 在 memory adapter 中记录文本语义向量；
-   - VOS 更新时通过文本相似度筛选目标，避免 drift。
-3. **DPSR**：
-   - 定义损失 `L_dpsr = λ1 * Dice(prev_mask, curr_pred) + λ2 * MSE(prev_feat, curr_feat)`。
-   - 在 `RapSAMVideoHead.loss` 中加入额外项。
+- **多任务统一架构**：单模型支持多种分割任务
+  - 图像交互分割（点、框、文本提示）
+  - 视频交互分割（点、框、文本提示）
+  - 视频对象分割（VOS）
+  - 全景分割
 
-### 5. 训练与蒸馏流程
+- **智能任务路由**：自动检测任务类型并路由到相应处理路径
+- **流式记忆管理**：VOS 任务中的长期/短期记忆机制
+- **多模态提示融合**：融合点、框、文本等多种提示类型
+- **实时推理**：针对 1080p 输入优化，目标 ≥ 25 FPS
 
-#### 5.1 数据预处理
-- **COCO**：生成交互提示（随机选点/框 + 文本描述），保存在 `data/annotations/fastsam2_interactive.json`。
-- **YouTube-VIS 2019**：
-  - 生成视频 clip（长度 8~16），存储切片信息。
-  - 提取关键帧并标注交互提示，另存 `ytvis_interactive_meta.pkl`。
-- **DAVIS**：
-  - 转换为统一格式（`TrackDataSample`），包含高质量 mask 序列。
+### 技术亮点
 
-#### 5.2 在线蒸馏框架
-- 训练阶段常驻加载 SAM2 教师模型（`sam2_teacher` 模块），与学生网络共享 batch 图像：
-  - 在训练循环中调用 `teacher.forward(images, prompts)` 取得视觉 token / mask 预测；
-  - 支持 fp16/bf16 推理、DeviceList 指定教师所用 GPU。
-- 蒸馏损失设计：
-  - 视觉特征：`L_visual = α * ||f_student - W * f_teacher||_2 + β * (1 - cos)`；
-  - Mask logit：`L_mask = γ * BCE(student_mask, teacher_mask)`；
-  - Prompt 对齐：`L_prompt = δ * KL(student_prompt || teacher_prompt)`。
-  - 推荐权重：α=1.0, β=0.5, γ=1.0, δ=0.2（可按训练效果调节）。
-- Prompt 生成在线完成（点/框/文本），必要时在 dataloader 或 Hook 中缓存，以减少重复解析。
+- **TaskRouter**：自动任务类型检测和动态路由
+- **StreamingMemoryAdapter**：VOS 记忆管理，支持自适应更新策略
+- **PromptFusion**：多模态提示融合，支持文本-视觉对齐
+- **Dual-Path Self-Refinement (DPSR)**：时序一致性增强
 
-#### 5.3 训练阶段划分
-| 阶段 | 模型组件 | 数据 | 主要目标 | 设备建议 |
-| --- | --- | --- | --- | --- |
-| Stage 1 | 改进骨干 + 蒸馏头 | COCO + YouTube-VIS | 学习双路径特征，完成蒸馏 | 8×4090 |
-| Stage 2 | 重构 RapSAM head + TaskRouter | YouTube-VIS（交互）+ COCO | 实现实时交互能力 | 8×3090 |
-| Stage 3 | VOS 模块（memory+DPSR） | YouTube-VIS + DAVIS | 稳定时序 + 高精度 VOS | 8×4090 |
-| Stage 4 | 多任务联合微调 | 三数据混合 | 统一多任务表现 | 8×4090 |
-| Stage 5 | 推理/部署优化 | Demo + Benchmark | 验证 FPS & 精度 | 8×3090 |
+## 🎯 支持的模型和任务
 
-#### 5.4 训练脚本框架
-- 新增 `tools/train_fast_sam2.py`：
-  - 支持 `--stage`、`--teacher-config`、`--task-mode`；
-  - 在训练循环调用 `sam2_teacher` 模块，实现在线蒸馏。
-- 配置文件结构：
-  - `configs/fastsam2/` 下新增：
-    - `stage1_backbone_distill.py`
-    - `stage2_interactive.py`
-    - `stage3_vos.py`
-    - `stage4_joint.py`
-    - `runtime_default.py`（通用 runtime）。
-- 各 stage 配置要对齐数据加载、模型组件开关（如 `use_task_router=True`）。
+### 模型架构
 
-### 6. 推理与评测
+- **RapSAM**：多任务分割检测器
+  - Backbone: ResNet / OpenCLIP (ConvNeXt/ResNet)
+  - Neck: YOSONeck (Lite Deform FPN)
+  - Head: RapSAMVideoHead (多阶段 query 更新)
 
-#### 6.1 Demo/工具链
-- 扩展 `demo/demo.py`：
-  - 增加 `--task {interactive_image, interactive_video, vos, panoptic}`；
-  - 视频模式下支持实时交互（监听点/框输入）、文本提示。
-- 新增 `tools/benchmark/benchmark_realtime.py`：
-  - 统计不同输入尺寸的 FPS + GPU 利用率；
-  - 提供 log 输出，便于回归。
+### 支持的任务
 
-#### 6.2 评估指标
-- `InteractiveEvaluator`：扩展支持多轮交互统计（NOC@0.5/0.8/0.9，mIoU@iter）。
-- VOS 指标：集成 DAVIS 官方 `J&F` 评估脚本（保存结果后统一评估）。
-- 全景分割：沿用 COCO Panoptic AP。
+| 任务类型 | 输入 | 输出 | 数据集 |
+|---------|------|------|--------|
+| 图像交互分割 | 图像 + 点/框/文本 | Mask | COCO, RefCOCO, SAM |
+| 视频交互分割 | 视频 + 点/框/文本 | Mask 序列 | YouTube-VIS 2019/2021 |
+| 视频对象分割 | 视频 + 第一帧标注 | Mask 序列 | DAVIS 2017, VIPSeg |
+| 全景分割 | 图像/视频 | Panoptic Mask | COCO, Cityscapes |
 
-### 7. 实现细节清单
+## 🚀 安装
 
-1. **代码目录调整**
-   - `seg/models/backbones/openclip_backbone.py`：新增几何分支、token pruner、蒸馏 hook。
-   - `seg/models/backbones/modules/`（新建目录）：放置 `token_pruner.py`、`fusion.py`。
-   - `seg/models/utils/`：新增 `task_router.py`、`memory_adapter.py`、`prompt_fusion.py`、`distill_utils.py`。
-   - `seg/models/heads/rapsam_head.py`：重构 head，拆分 adaptor，引入低秩注意力/记忆接口。
-   - `seg/models/necks/ramsam_neck.py`：新增 `MaskStateRefiner` 模块及调用。
-   - `seg/models/detectors/rapsam.py`：增加 `MODE` 参数（interactive/vos/panoptic），根据模式调用 TaskRouter。
-   - `seg/models/data_preprocessor/vid_sam_preprocessor.py`：补充 VOS 数据处理（mask propagate、memory 占位符）。
+### 环境要求
 
-2. **配置/脚本**
-   - `configs/fastsam2/*`：分 stage 配置，定义模型组件开关、蒸馏权重、训练时长。
-   - `tools/train_fast_sam2.py`、`tools/benchmark/benchmark_realtime.py`。
+- Python >= 3.8
+- PyTorch >= 1.10.0
+- CUDA >= 11.0
+- mmdetection >= 3.0.0
+- mmengine >= 0.8.0
 
-3. **训练策略**
-   - 优化器：AdamW（lr=1e-4），backbone 分段学习率（几何分支 > CLIP）。
-   - 学习率策略：Cosine decay + warmup（5 % epoch）。
-   - 交互训练增加 prompt 随机性（点/框数量、文本描述多样）。
-   - VOS 训练使用 curriculum：先短序列（4-6 帧）再长序列（12-16 帧）。
+### 安装步骤
 
-4. **性能优化**
-   - 混合精度训练（AMP）。
-   - 推理阶段支持 TensorRT/ONNX（后续拓展）。
-   - 视频流采用渐进式解码（处理过的帧缓存，减少重复计算）。
+1. **克隆仓库**
+```bash
+git clone https://github.com/cjhcjh123-666/Fastsam2.git
+cd Fastsam2-main
+```
 
-### 8. 时间与里程碑（建议）
-| 时间（周） | 任务 | 里程碑 |
-| --- | --- | --- |
-| 第 1-2 周 | 搭建 Stage1 蒸馏训练，完成骨干改造 | 获得蒸馏后骨干权重，FPS 初步验证 |
-| 第 3-4 周 | 实现 TaskRouter + Streaming Memory，训练 Stage2 | 视频交互达到目标 FPS，交互指标优于 baseline |
-| 第 5-6 周 | 集成 VOS（memory + DPSR），训练 Stage3 | DAVIS J&F 提升，时序稳定 |
-| 第 7 周 | 多任务联合微调，统一推理 Demo | 单模型覆盖所有任务，demo 支持实时交互 |
-| 第 8 周 | 完成基准评测与文档 | 输出完整 benchmark 与使用文档 |
+2. **创建 conda 环境**
+```bash
+conda create -n rap_sam_fuxian python=3.8
+conda activate rap_sam_fuxian
+```
 
-### 9. 风险与对策
-- **蒸馏不收敛**：调整蒸馏权重/特征对齐方式；尝试多层监督（骨干中间层）。
-- **实时性能不足**：进一步调低 token 保留率、减少 decoder stage、启用 TensorRT。
-- **交互/VOS 数据不足**：利用 SAM2 生成伪标签补充；对 YouTube-VIS/DAVIS 做数据增强。
-- **多任务冲突**：采用任务权重动态调整（GradNorm），或阶段性交替训练。
+3. **安装依赖**
+```bash
+# 安装 PyTorch (根据您的 CUDA 版本)
+conda install pytorch torchvision torchaudio cudatoolkit=11.3 -c pytorch
 
-### 10. 后续工作
-- 完成上述代码与训练后，更新 README、撰写技术报告，并准备公开发布/论文撰写。
-- 评估与部署：考虑将实时推理封装为服务（RESTful/WebSocket），支持在线交互。
+# 安装 mmdetection 和相关依赖
+pip install mmdet mmengine mmcv-full -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10.0/index.html
+
+# 安装其他依赖
+pip install -r requirements.txt  # 如果有 requirements.txt
+```
+
+4. **安装项目**
+```bash
+pip install -e .
+```
+
+## 📦 数据集准备
+
+### 支持的数据集
+
+项目支持以下数据集：
+
+- **COCO**：图像全景分割和交互分割
+- **YouTube-VIS 2019/2021**：视频实例分割
+- **DAVIS 2017**：视频对象分割
+- **VIPSeg**：视频全景分割
+- **Cityscapes**：城市街景全景分割
+- **RefCOCO**：引用表达分割
+- **SAM**：类别无关分割
+
+### 数据集目录结构
+
+```
+data/
+├── coco/
+│   ├── train2017/
+│   ├── val2017/
+│   └── annotations/
+│       ├── panoptic_train2017.json
+│       ├── panoptic_val2017.json
+│       └── panoptic_train2017/
+├── youtube_vis_2019/
+│   ├── train/
+│   └── valid/
+├── davis/
+│   └── DAVIS/
+│       ├── Annotations/
+│       └── ImageSets/
+├── ref_seg/
+│   └── refcoco/
+└── ...
+```
+
+### 数据集配置
+
+数据集配置位于 `configs/_base_/datasets/` 目录下。主要配置文件：
+
+- `coco_panoptic_video_yt19_yt21_davis_vip_city_sam_ref.py`：多数据集混合训练配置
+
+## 🏃 快速开始
+
+### 1. 检查点准备
+
+下载预训练权重到 `checkpoints/` 目录：
+
+```bash
+mkdir -p checkpoints
+
+# ResNet-50 预训练权重
+# 下载 resnet50-0676ba61.pth 到 checkpoints/
+
+# OpenCLIP 预训练权重
+# 下载 openclip_vitl14_pretrain.pt 到 checkpoints/
+```
+
+### 2. 配置文件
+
+主要配置文件：`configs/rap_sam/rap_sam_r50_12e_adaptor.py`
+
+### 3. 单卡训练
+
+```bash
+conda activate rap_sam_fuxian
+cd /mnt/chenjiahui/Fastsam2-main
+python tools/train.py configs/rap_sam/rap_sam_r50_12e_adaptor.py \
+    --work-dir work_dirs/rap_sam_r50_12e
+```
+
+### 4. 多卡训练（推荐）
+
+```bash
+# 8 卡训练
+bash tools/dist_train.sh configs/rap_sam/rap_sam_r50_12e_adaptor.py 8 \
+    --work-dir work_dirs/rap_sam_r50_12e
+```
+
+## 🎓 训练
+
+### 训练配置
+
+训练配置在 `configs/rap_sam/rap_sam_r50_12e_adaptor.py` 中定义，包括：
+
+- **模型配置**：backbone、neck、head 设置
+- **多任务组件**：TaskRouter、StreamingMemory、PromptFusion
+- **数据配置**：数据集路径、数据增强
+- **训练策略**：学习率、优化器、损失函数
+
+### 关键配置说明
+
+```python
+# 多任务组件配置
+task_router = dict(
+    type='TaskRouter',
+    feat_channels=256,
+    num_decoder_stages=3,
+    enable_streaming_memory=True,
+    interactive_stages=3,
+    vos_stages=3,
+    panoptic_stages=3
+)
+
+# DDP 配置（多任务训练必须）
+find_unused_parameters = True  # 关键：混合数据集训练需要
+```
+
+### 训练选项
+
+```bash
+# 启用混合精度训练
+python tools/train.py configs/rap_sam/rap_sam_r50_12e_adaptor.py --amp
+
+# 自动缩放学习率
+python tools/train.py configs/rap_sam/rap_sam_r50_12e_adaptor.py --auto-scale-lr
+
+# 从检查点恢复
+python tools/train.py configs/rap_sam/rap_sam_r50_12e_adaptor.py --resume work_dirs/rap_sam_r50_12e/latest.pth
+```
+
+### 训练阶段
+
+根据 `FASTSAM2_IMPLEMENTATION_PLAN.md`，训练分为多个阶段：
+
+1. **Stage 1**：骨干网络 + 蒸馏训练
+2. **Stage 2**：交互分割能力
+3. **Stage 3**：VOS 模块（memory + DPSR）
+4. **Stage 4**：多任务联合微调
+5. **Stage 5**：推理优化
+
+## 🔍 推理
+
+### 使用 Demo
+
+```bash
+python demo/demo.py \
+    --config configs/rap_sam/rap_sam_r50_12e_adaptor.py \
+    --checkpoint work_dirs/rap_sam_r50_12e/latest.pth \
+    --input demo/demo.jpg \
+    --task interactive_image \
+    --output demo/output.jpg
+```
+
+### 任务类型
+
+- `interactive_image`：图像交互分割
+- `interactive_video`：视频交互分割
+- `vos`：视频对象分割
+- `panoptic`：全景分割
+
+### 评估
+
+```bash
+# 评估 COCO 全景分割
+python tools/test.py configs/rap_sam/eval_rap_sam_coco.py \
+    work_dirs/rap_sam_r50_12e/latest.pth
+
+# 评估 YouTube-VIS
+python tools/test.py configs/rap_sam/eval_rap_sam_yt19.py \
+    work_dirs/rap_sam_r50_12e/latest.pth
+
+# 评估交互分割
+python tools/test.py configs/rap_sam/eval_rap_sam_prompt.py \
+    work_dirs/rap_sam_r50_12e/latest.pth
+```
+
+## 📁 项目结构
+
+```
+Fastsam2-main/
+├── configs/                 # 配置文件
+│   ├── _base_/              # 基础配置
+│   │   ├── datasets/        # 数据集配置
+│   │   └── schedules/      # 训练策略
+│   └── rap_sam/            # RapSAM 模型配置
+├── seg/                    # 分割模块
+│   ├── models/             # 模型定义
+│   │   ├── backbones/      # 骨干网络
+│   │   ├── necks/          # 颈部网络
+│   │   ├── heads/          # 检测头
+│   │   ├── detectors/      # 检测器
+│   │   ├── utils/          # 工具模块
+│   │   │   ├── task_router.py        # 任务路由
+│   │   │   ├── memory_adapter.py     # 流式记忆
+│   │   │   └── prompt_fusion.py      # 提示融合
+│   │   └── data_preprocessor/        # 数据预处理
+│   ├── datasets/           # 数据集
+│   └── evaluation/         # 评估指标
+├── ext/                    # 外部库
+│   ├── sam/                # SAM 相关模块
+│   ├── open_clip/          # OpenCLIP
+│   └── davis2017/          # DAVIS 评估
+├── tools/                  # 工具脚本
+│   ├── train.py           # 训练脚本
+│   ├── test.py            # 测试脚本
+│   └── dist_train.sh      # 分布式训练
+├── demo/                   # Demo 示例
+├── checkpoints/            # 预训练权重
+└── work_dirs/             # 训练输出
+```
+
+## ⚙️ 配置说明
+
+### 多任务组件
+
+#### TaskRouter
+
+自动检测任务类型并配置相应的处理路径：
+
+```python
+task_router = dict(
+    type='TaskRouter',
+    feat_channels=256,
+    num_decoder_stages=3,
+    enable_streaming_memory=True,
+    interactive_stages=3,    # 交互任务 decoder stages
+    vos_stages=3,            # VOS 任务 decoder stages
+    panoptic_stages=3        # 全景任务 decoder stages
+)
+```
+
+#### StreamingMemoryAdapter
+
+VOS 任务的记忆管理：
+
+```python
+streaming_memory = dict(
+    type='StreamingMemoryAdapter',
+    feat_channels=256,
+    long_mem_size=10,        # 长期记忆大小
+    short_mem_size=5,        # 短期记忆大小
+    update_strategy='adaptive'  # 更新策略：FIFO/Quality/Adaptive
+)
+```
+
+#### PromptFusion
+
+多模态提示融合：
+
+```python
+prompt_fusion = dict(
+    type='PromptFusion',
+    feat_channels=256,
+    num_heads=8,
+    dropout=0.1,
+    use_text_encoder=True,
+    text_encoder=dict(
+        type='TextEncoder',
+        feat_channels=256,
+        text_model_cfg=dict(
+            type=OpenCLIPBackboneText,
+            model_name='ViT-L-14',
+            init_cfg=dict(
+                type='clip_pretrain',
+                checkpoint='checkpoints/openclip_vitl14_pretrain.pt'
+            )
+        )
+    )
+)
+```
+
+### 模型配置
+
+主要模型配置在 `configs/rap_sam/rap_sam_r50_12e_adaptor.py`：
+
+- **Backbone**：ResNet-50 或 OpenCLIP
+- **Neck**：YOSONeck (Lite Deform FPN)
+- **Head**：RapSAMVideoHead
+- **损失函数**：分类损失、Mask 损失、Dice 损失
+
+## ❓ 常见问题
+
+### 1. 设备不匹配错误
+
+**问题**：`RuntimeError: Expected all tensors to be on the same device`
+
+**解决**：确保所有模型参数正确注册为 buffer 或 parameter。已修复 SAMPromptEncoder 的设备问题。
+
+### 2. SyncBatchNorm 错误
+
+**问题**：单卡训练时 SyncBatchNorm 报错
+
+**解决**：单卡训练时使用普通 BN，多卡训练时使用 SyncBN。配置中已设置 `norm_cfg=dict(type='BN', requires_grad=True)`。
+
+### 3. DDP 训练错误
+
+**问题**：`find_unused_parameters` 相关错误
+
+**解决**：多任务训练必须设置 `find_unused_parameters = True`，因为某些模块（如 TextEncoder）只在特定任务中使用。
+
+### 4. 内存不足
+
+**问题**：训练时显存不足
+
+**解决**：
+- 减小 batch size
+- 减少 decoder stages
+- 使用梯度累积
+- 启用混合精度训练 (`--amp`)
+
+### 5. 数据集加载错误
+
+**问题**：数据集路径或格式错误
+
+**解决**：
+- 检查数据集路径配置
+- 确认数据集格式符合要求
+- 查看日志中的具体错误信息
+
+## 📊 性能指标
+
+### 训练配置
+
+- **硬件**：8×RTX 3090 / 8×RTX 4090 (24GB)
+- **Batch Size**：根据数据集和 GPU 数量调整
+- **学习率**：1e-4 (AdamW)
+- **训练轮数**：12 epochs
+
+### 目标性能
+
+- **推理速度**：1080p 输入 ≥ 25 FPS
+- **精度**：超越 SAM / SAM2 baseline
+
+## 🔧 开发与贡献
+
+### 代码规范
+
+- 遵循 MMDetection 代码规范
+- 使用类型注解
+- 添加必要的文档字符串
+
+### 调试建议
+
+1. **检查任务检测**：在训练日志中查看任务类型是否正确识别
+2. **验证组件状态**：确认 TaskRouter、StreamingMemory、PromptFusion 已正确初始化
+3. **检查数据格式**：验证输入数据包含必要的字段（`gt_instances_collected`、`text` 等）
+
+## 📚 相关文档
+
+- `PROJECT_DIAGNOSIS_REPORT.md`：项目诊断报告
+- `FASTSAM2_IMPLEMENTATION_PLAN.md`：实现计划
+- `MULTI_TASK_REFACTORING_SUMMARY.md`：多任务重构总结
+- `MULTI_TASK_ARCHITECTURE.md`：多任务架构说明
+
+## 📝 更新日志
+
+### 最新更新
+
+- ✅ 修复 SAMPromptEncoder 设备不匹配问题
+- ✅ 完善 StreamingMemory 的实际应用
+- ✅ 优化 DPSR 损失计算
+- ✅ 完善文本编码器集成
+- ✅ 支持多数据集混合训练
+
+## 📄 许可证
+
+本项目遵循相应的开源许可证。请查看 LICENSE 文件了解详情。
+
+## 🙏 致谢
+
+- [MMDetection](https://github.com/open-mmlab/mmdetection)：检测框架
+- [SAM](https://github.com/facebookresearch/segment-anything)：分割模型
+- [OpenCLIP](https://github.com/mlfoundations/open_clip)：CLIP 实现
+
+## 📧 联系方式
+
+如有问题或建议，请通过以下方式联系：
+
+- GitHub Issues：[提交 Issue](https://github.com/cjhcjh123-666/Fastsam2/issues)
 
 ---
-本方案覆盖了 FastSAM2 的总体架构升级、模块改造、训练/蒸馏流程、评测部署等细节，可据此逐步实施。若后续需求有变，可在对应阶段及时调整。
+
+**注意**：本项目仍在积极开发中，API 可能会有变化。建议查看最新文档和代码。
 
