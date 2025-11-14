@@ -293,23 +293,26 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
         # Integrate fused prompts into object_kernels if available
         # This ensures PromptFusion parameters participate in gradient computation
         if fused_prompts is not None:
-            # fused_prompts shape: [B, N_prompts, C]
-            # object_kernels shape: [B, N_queries, C]
-            # We can either:
-            # 1. Concatenate fused_prompts to object_kernels (add prompt queries)
-            # 2. Use fused_prompts to initialize/update first N_prompts kernels
-            # Option 2: Use fused prompts to initialize first N_prompts kernels
-            num_prompts = fused_prompts.shape[1]
-            if num_prompts > 0 and num_prompts <= object_kernels.shape[1]:
-                # Average or sum fused prompts to get a single prompt embedding per sample
-                # Then add it to all kernels (or just first few)
-                prompt_embed = fused_prompts.mean(dim=1, keepdim=True)  # [B, 1, C]
-                # Add prompt embedding to first few kernels to guide the prediction
-                num_kernels_to_update = min(num_prompts, object_kernels.shape[1])
-                object_kernels[:, :num_kernels_to_update, :] = (
-                    object_kernels[:, :num_kernels_to_update, :] + 
-                    prompt_embed.expand(-1, num_kernels_to_update, -1) * 0.1  # Weighted fusion
-                )
+            # fused_prompts shape: [B_fused, N_prompts, C]
+            # object_kernels shape: [B_obj, N_queries, C]
+            # Check batch size compatibility
+            fused_batch_size = fused_prompts.shape[0]
+            obj_batch_size = object_kernels.shape[0]
+            
+            # Only integrate if batch sizes match
+            if fused_batch_size == obj_batch_size:
+                num_prompts = fused_prompts.shape[1]
+                if num_prompts > 0 and num_prompts <= object_kernels.shape[1]:
+                    # Average or sum fused prompts to get a single prompt embedding per sample
+                    # Then add it to all kernels (or just first few)
+                    prompt_embed = fused_prompts.mean(dim=1, keepdim=True)  # [B, 1, C]
+                    # Add prompt embedding to first few kernels to guide the prediction
+                    num_kernels_to_update = min(num_prompts, object_kernels.shape[1])
+                    object_kernels[:, :num_kernels_to_update, :] = (
+                        object_kernels[:, :num_kernels_to_update, :] + 
+                        prompt_embed.expand(-1, num_kernels_to_update, -1) * 0.1  # Weighted fusion
+                    )
+            # If batch sizes don't match, skip integration but keep fused_prompts for gradient flow
         mask_features = x
         
         # Apply streaming memory for VOS tasks
