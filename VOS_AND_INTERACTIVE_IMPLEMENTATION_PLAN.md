@@ -167,8 +167,10 @@ texts = vlm_generator.generate_for_instances(
 ```
 
 #### 配置示例
+
+**1. 在模型配置中启用文本提示（SAMPromptEncoder）**
 ```python
-# 在模型配置中启用文本提示
+# 在neck配置中
 prompt_encoder=dict(
     type='SAMPromptEncoder',
     use_text_prompt=True,  # 启用文本提示
@@ -183,14 +185,42 @@ prompt_encoder=dict(
         ),
     ),
 )
+```
 
-# 可选：添加VLM文本生成器
+**2. 在head配置中启用文本提示融合**
+```python
+# 在head配置中
+panoptic_head=dict(
+    type='RapSAMVideoHead',  # 或 Mask2FormerVideoHead
+    # ... 其他配置 ...
+    prompt_fusion=dict(
+        type='PromptFusion',
+        feat_channels=256,
+        use_text_encoder=True,
+        text_encoder=dict(
+            type='TextEncoder',
+            text_model_cfg=dict(type='CLIPTextEncoder', ...),
+            feat_channels=256,
+        ),
+    ),
+)
+```
+
+**3. 可选：添加VLM文本生成器**
+```python
+# 在数据预处理pipeline中
 vlm_text_generator=dict(
     type='VLMTextGenerator',
     vlm_cfg=dict(type='CoCa', ...),  # 可选，如果不配置则使用类别名称
     use_class_names=True,
 )
 ```
+
+**4. 数据格式要求**
+文本数据应该存储在 `gt_instances_collected.text` 中：
+- 可以是字符串列表：`['text1', 'text2', ...]`
+- 每个文本对应一个prompt（与point_coords的数量对应）
+- 如果没有文本，可以设置为 `None` 或不设置该属性
 
 ### 3.3 视频交互分割
 
@@ -287,9 +317,11 @@ vlm_text_generator=dict(
 ### 阶段3: 文本提示
 1. ✅ 集成 `PromptFusion` 到 `SAMPromptEncoder`
 2. ✅ 创建 `VLMTextGenerator` 模块
-3. 完善 RefCOCO 数据流
-4. 支持文本+点/框混合提示
-5. 集成VLM文本生成到训练/推理流程
+3. ✅ 扩展 `prepare_for_dn_mo` 方法支持文本提示
+4. ✅ 在head中集成文本提示处理
+5. ⚠️ 完善 RefCOCO 数据流（需要测试）
+6. ⚠️ 支持文本+点/框混合提示（已实现，需测试）
+7. ⚠️ 集成VLM文本生成到训练/推理流程（可选）
 
 ### 阶段4: 视频交互分割
 1. 扩展交互分割到视频场景
@@ -339,7 +371,8 @@ vlm_text_generator=dict(
 - ❌ 第一帧 mask 匹配逻辑（约 50-100 行代码）
 - ✅ 文本提示支持（`SAMPromptEncoder` 已扩展）
 - ✅ VLM文本生成器（`VLMTextGenerator` 已实现）
-- ⚠️ 文本提示在推理时的处理流程（需要集成到head中）
+- ✅ 文本提示在head中的处理流程（`prepare_for_dn_mo` 已扩展）
+- ⚠️ 文本提示在推理时的完整流程（需要测试）
 - ❌ VOS 专用推理方法
 
 ## 九、配置文件建议

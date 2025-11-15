@@ -27,7 +27,7 @@ from mmdet.models.utils import multi_apply, preprocess_panoptic_gt, get_uncertai
 from mmdet.models.dense_heads.anchor_free_head import AnchorFreeHead
 from mmcv.cnn.bricks.transformer import FFN, MultiheadAttention
 from seg.models.necks import SAMPromptEncoder
-from seg.models.utils import preprocess_video_panoptic_gt, mask_pool
+from seg.models.utils import preprocess_video_panoptic_gt, mask_pool, PromptFusion
 
 
 @MODELS.register_module()
@@ -93,6 +93,8 @@ class Mask2FormerVideoHead(AnchorFreeHead):
                  ov_classifier_name: Optional[str] = None,
                  logit: Optional[int] = None,
                  use_adaptor = False,
+                 # text prompt configs
+                 prompt_fusion: OptConfigType = None,
                  **kwargs) -> None:
         super(AnchorFreeHead, self).__init__(init_cfg=init_cfg)
         self.use_adaptor = use_adaptor
@@ -166,6 +168,15 @@ class Mask2FormerVideoHead(AnchorFreeHead):
         self.loss_cls = MODELS.build(loss_cls)
         self.loss_mask = MODELS.build(loss_mask)
         self.loss_dice = MODELS.build(loss_dice)
+        
+        # Text prompt fusion module (optional)
+        if prompt_fusion is not None:
+            prompt_fusion_ = copy.deepcopy(prompt_fusion)
+            if 'feat_channels' not in prompt_fusion_:
+                prompt_fusion_['feat_channels'] = feat_channels
+            self.prompt_fusion = MODELS.build(prompt_fusion_)
+        else:
+            self.prompt_fusion = None
 
         # prepare OV things
         # OV cls embed
@@ -1090,6 +1101,54 @@ class Mask2FormerVideoHead(AnchorFreeHead):
             known_bbox_expand = known_bbox_expand.clamp(min=0.0, max=1.0)
 
         input_label_embed = self.pb_embedding(known_pb_labels_expaned)
+
+        # Handle text prompts if available
+        has_text = False
+        text_embeddings = None
+        if self.prompt_fusion is not None:
+            # Check if any instance has text
+            texts_list = []
+            for inst in gt_instances:
+                if hasattr(inst, 'text') and inst.text is not None:
+                    if isinstance(inst.text, list):
+                        texts_list.append(inst.text)
+                    else:
+                        texts_list.append([inst.text])
+                    has_text = True
+                else:
+                    texts_list.append(None)
+            
+            if has_text:
+                # Prepare point and box embeddings for fusion
+                # Point embeddings: we can use the point coordinates
+                # For now, we'll use the pb_embedding as point-like embedding
+                point_embeds = input_label_embed  # [B, N, C]
+                
+                # Box embeddings: convert boxes to embeddings
+                # We can use a simple projection or reuse bbox embedding
+                box_embeds = None  # Can be added later if needed
+                
+                # Process text for each sample in batch
+                batch_text_embeds = []
+                for i, texts in enumerate(texts_list):
+                    if texts is not None:
+                        # Fuse text with point embeddings
+                        fused = self.prompt_fusion(
+                            point_embed=point_embeds[i:i+1],  # [1, N, C]
+                            box_embed=box_embeds[i:i+1] if box_embeds is not None else None,
+                            text=texts  # List of strings
+                        )
+                        if fused is not None:
+                            batch_text_embeds.append(fused[0])  # [N, C]
+                        else:
+                            batch_text_embeds.append(point_embeds[i])
+                    else:
+                        batch_text_embeds.append(point_embeds[i])
+                
+                # Stack text embeddings
+                if batch_text_embeds:
+                    text_embeddings = torch.stack(batch_text_embeds, dim=0)  # [B, N, C]
+                    input_label_embed = text_embeddings
 
         input_bbox_embed = inverse_sigmoid(known_bbox_expand)
 
