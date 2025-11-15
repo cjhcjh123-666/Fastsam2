@@ -241,12 +241,12 @@ class PromptFusion(nn.Module):
         
         batch_size = base_embed.shape[0]
         
-        # If we have text embeddings, use cross-attention to fuse them with base embeddings
-        # Query: base_embed (point/box), Key+Value: text_embed
-        # This enhances base_embed with text information without changing its shape
-        if text_embed is not None and text_embed.abs().sum() > 0:  # Check if not all zeros
+        # CRITICAL for DDP: Always use text_embed in computation if it exists (even if dummy/zeros)
+        # This ensures gradient flow through text_encoder parameters
+        if text_embed is not None:
             # Use cross-attention: text enhances point/box embeddings
             # Query from base, Key+Value from text
+            # Even if text_embed is all zeros (dummy), we still need to use it for gradient flow
             enhanced, _ = self.cross_attn(
                 base_embed, text_embed, text_embed
             )
@@ -258,23 +258,8 @@ class PromptFusion(nn.Module):
             
             return out
         else:
-            # No text or text is dummy (all zeros), return base_embed unchanged
-            # But still need to pass through network for gradient flow if text_encoder was called
-            if text_embed is not None:
-                # Text encoder was called (for DDP), so pass base through attention with itself
-                enhanced, _ = self.cross_attn(
-                    base_embed, base_embed, base_embed
-                )
-                enhanced = self.norm1(enhanced + base_embed)
-                
-                # FFN
-                out = self.ffn(enhanced)
-                out = self.norm2(out + enhanced)
-                
-                return out
-            else:
-                # No text encoder at all, return base as is
-                return base_embed
+            # No text encoder at all, return base as is
+            return base_embed
     
     def compute_text_visual_alignment_loss(self,
                                            text_embed: torch.Tensor,
