@@ -225,84 +225,56 @@ class PromptFusion(nn.Module):
                 if dummy_text_embed is not None:
                     text_embed = dummy_text_embed * 0.0  # Zero out to not affect output but maintain gradient flow
         
-        # Collect available prompts
-        prompts = []
-        batch_size = None
+        # Strategy: Use text to enhance point/box embeddings via cross-attention
+        # This maintains the number of queries (points/boxes) while incorporating text information
         
-        if point_embed is not None:
-            prompts.append(point_embed)
-            batch_size = point_embed.shape[0]
-        if box_embed is not None:
-            prompts.append(box_embed)
-            if batch_size is None:
-                batch_size = box_embed.shape[0]
-            elif batch_size != box_embed.shape[0]:
-                # Batch size mismatch, pad or trim to match
-                if batch_size < box_embed.shape[0]:
-                    # Trim box_embed
-                    box_embed = box_embed[:batch_size]
-                else:
-                    # Pad box_embed with empty embeddings
-                    feat_dim = box_embed.shape[-1]
-                    pad_size = batch_size - box_embed.shape[0]
-                    empty_box = torch.empty((pad_size, 0, feat_dim), device=box_embed.device)
-                    box_embed = torch.cat([box_embed, empty_box], dim=0)
-                prompts[-1] = box_embed  # Update the last added prompt
-        if text_embed is not None:
-            prompts.append(text_embed)
-            if batch_size is None:
-                batch_size = text_embed.shape[0]
-            elif batch_size != text_embed.shape[0]:
-                # Batch size mismatch, pad or trim to match
-                if batch_size < text_embed.shape[0]:
-                    # Trim text_embed
-                    text_embed = text_embed[:batch_size]
-                else:
-                    # Pad text_embed with empty embeddings
-                    feat_dim = text_embed.shape[-1]
-                    pad_size = batch_size - text_embed.shape[0]
-                    empty_text = torch.empty((pad_size, 0, feat_dim), device=text_embed.device)
-                    text_embed = torch.cat([text_embed, empty_text], dim=0)
-                prompts[-1] = text_embed  # Update the last added prompt
+        # Start with point or box embeddings as the base
+        base_embed = point_embed if point_embed is not None else box_embed
         
-        if not prompts:
-            # No real prompts, but we called text_encoder for DDP
-            # If we have a dummy text_embed (from text_encoder(None)), use it to ensure gradient flow
+        if base_embed is None:
+            # No point or box embeddings, only text
+            # In this case, return text_embed directly (rare case)
             if text_embed is not None:
-                # Use the dummy embedding (already zeroed out) to ensure gradient flow
-                # Return a minimal embedding that doesn't affect output
                 return text_embed
-            # If no prompts at all, return None
-            # This should be rare if text_encoder always returns something
-            return None
+            else:
+                return None
         
-        # Ensure all prompts have the same batch size
-        if batch_size is not None:
-            for i, prompt in enumerate(prompts):
-                if prompt.shape[0] != batch_size:
-                    # Pad or trim to match batch_size
-                    if prompt.shape[0] < batch_size:
-                        feat_dim = prompt.shape[-1]
-                        pad_size = batch_size - prompt.shape[0]
-                        empty_prompt = torch.empty((pad_size, 0, feat_dim), device=prompt.device)
-                        prompts[i] = torch.cat([prompt, empty_prompt], dim=0)
-                    else:
-                        prompts[i] = prompt[:batch_size]
+        batch_size = base_embed.shape[0]
         
-        # Concatenate all prompts
-        concat_prompts = torch.cat(prompts, dim=1)  # [B, N_total, C]
-        
-        # Self-attention for prompt fusion
-        fused, _ = self.cross_attn(
-            concat_prompts, concat_prompts, concat_prompts
-        )
-        fused = self.norm1(fused + concat_prompts)
-        
-        # FFN
-        out = self.ffn(fused)
-        out = self.norm2(out + fused)
-        
-        return out
+        # If we have text embeddings, use cross-attention to fuse them with base embeddings
+        # Query: base_embed (point/box), Key+Value: text_embed
+        # This enhances base_embed with text information without changing its shape
+        if text_embed is not None and text_embed.abs().sum() > 0:  # Check if not all zeros
+            # Use cross-attention: text enhances point/box embeddings
+            # Query from base, Key+Value from text
+            enhanced, _ = self.cross_attn(
+                base_embed, text_embed, text_embed
+            )
+            enhanced = self.norm1(enhanced + base_embed)
+            
+            # FFN
+            out = self.ffn(enhanced)
+            out = self.norm2(out + enhanced)
+            
+            return out
+        else:
+            # No text or text is dummy (all zeros), return base_embed unchanged
+            # But still need to pass through network for gradient flow if text_encoder was called
+            if text_embed is not None:
+                # Text encoder was called (for DDP), so pass base through attention with itself
+                enhanced, _ = self.cross_attn(
+                    base_embed, base_embed, base_embed
+                )
+                enhanced = self.norm1(enhanced + base_embed)
+                
+                # FFN
+                out = self.ffn(enhanced)
+                out = self.norm2(out + enhanced)
+                
+                return out
+            else:
+                # No text encoder at all, return base as is
+                return base_embed
     
     def compute_text_visual_alignment_loss(self,
                                            text_embed: torch.Tensor,
