@@ -37,10 +37,16 @@ class TextEncoder(nn.Module):
             # Project text features to feat_channels if needed
             if hasattr(self.text_model, 'embed_dim'):
                 text_dim = self.text_model.embed_dim
-                if text_dim != feat_channels:
-                    self.text_proj = nn.Linear(text_dim, feat_channels)
-                else:
-                    self.text_proj = nn.Identity()
+            elif hasattr(self.text_model, 'text_proj') and hasattr(self.text_model.text_proj, 'shape'):
+                # For OpenCLIP models, infer embed_dim from text_proj shape
+                # text_proj is [transformer_width, embed_dim], output is embed_dim
+                text_dim = self.text_model.text_proj.shape[1]
+            else:
+                # Default to 768 for CLIP-like models (e.g., ViT-L-14)
+                text_dim = 768
+            
+            if text_dim != feat_channels:
+                self.text_proj = nn.Linear(text_dim, feat_channels)
             else:
                 self.text_proj = nn.Identity()
         else:
