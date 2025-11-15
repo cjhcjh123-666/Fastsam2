@@ -58,20 +58,38 @@ class TextEncoder(nn.Module):
         Returns:
             Text embeddings [B, N_text, C] or None.
         """
-        # IMPORTANT: Even when text is None, we should still call text_model with dummy input
-        # to ensure all parameters participate in gradient computation (for DDP compatibility)
+        # CRITICAL for DDP: Even when text is None, we must call text_model with dummy input
+        # to ensure all parameters participate in gradient computation
         if text is None:
-            # If text_model exists, call it with dummy input to ensure gradient flow
             if self.text_model is not None:
-                # Create dummy input: use a zero tensor that still requires grad
-                # This ensures text_model parameters are used even when no text is provided
-                # We'll use a minimal dummy input that doesn't affect the output
+                # Create a dummy text input to ensure parameters participate in gradient computation
+                # For OpenCLIPBackboneText, we need actual tokenized text
                 device = next(self.text_proj.parameters()).device
-                # Create a dummy token sequence (e.g., [B, 1] with padding token)
-                # The exact format depends on text_model, but we'll create a minimal tensor
-                # For CLIP-like models, we might need actual token IDs, so we return None
-                # and let the caller handle it
-                return None
+                
+                # Try to create a dummy token sequence
+                # For CLIP models, we can use a padding token (usually 0) or EOS token
+                # Create a minimal valid token sequence: [B=1, L=1] with padding token
+                try:
+                    # Try to get tokenizer to create proper dummy tokens
+                    if hasattr(self.text_model, 'text_tokenizer'):
+                        # Create a dummy text string and tokenize it
+                        dummy_text = [""]  # Empty string
+                        dummy_tokens = self.text_model.text_tokenizer(dummy_text).to(device)
+                        # Encode the dummy tokens
+                        text_embed = self.text_model(dummy_text)
+                        # Project but multiply by 0 to not affect output
+                        if text_embed.dim() == 2:
+                            text_embed = text_embed.unsqueeze(1)
+                        text_embed = self.text_proj(text_embed) * 0.0  # Zero out to not affect output
+                        return text_embed
+                    else:
+                        # Fallback: return None but this might cause DDP issues
+                        # In this case, the caller should handle it
+                        return None
+                except Exception:
+                    # If anything fails, return None
+                    # The caller (PromptFusion) should handle this
+                    return None
             return None
         
         # Handle list of strings - would need tokenizer
@@ -180,19 +198,22 @@ class PromptFusion(nn.Module):
         """
         # CRITICAL for DDP: Always call text_encoder to ensure parameters have gradients
         # This prevents "Expected to have finished reduction" errors in distributed training
-        dummy_text_for_ddp = None
         if self.text_encoder is not None:
-            # Always call text_encoder, even with None input
+            # Always call text_encoder, even with None input, to ensure DDP compatibility
             if text is not None and text_embed is None:
                 # Handle list of strings
                 if isinstance(text, list):
-                    text_embed = self.text_encoder(None)  # Will return None for now
+                    text_embed = self.text_encoder(text)
                 else:
                     text_embed = self.text_encoder(text)
             elif text is None and text_embed is None:
-                # Create dummy text embedding to ensure text_encoder parameters are used
-                # This is necessary for DDP gradient synchronization
-                dummy_text_for_ddp = self.text_encoder(None)
+                # CRITICAL: Always call text_encoder even with None to ensure parameters participate
+                # This creates a dummy embedding that ensures gradient flow
+                dummy_text_embed = self.text_encoder(None)
+                # If dummy_text_embed is not None, we'll use it (multiplied by 0 to not affect output)
+                # If it's None, we'll handle it below
+                if dummy_text_embed is not None:
+                    text_embed = dummy_text_embed * 0.0  # Zero out to not affect output but maintain gradient flow
         
         # Collect available prompts
         prompts = []
@@ -236,7 +257,13 @@ class PromptFusion(nn.Module):
         
         if not prompts:
             # No real prompts, but we called text_encoder for DDP
-            # Return None but gradient flow through dummy_text_for_ddp is ensured
+            # If we have a dummy text_embed (from text_encoder(None)), use it to ensure gradient flow
+            if text_embed is not None:
+                # Use the dummy embedding (already zeroed out) to ensure gradient flow
+                # Return a minimal embedding that doesn't affect output
+                return text_embed
+            # If no prompts at all, return None
+            # This should be rare if text_encoder always returns something
             return None
         
         # Ensure all prompts have the same batch size

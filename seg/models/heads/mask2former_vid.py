@@ -1106,11 +1106,12 @@ class Mask2FormerVideoHead(AnchorFreeHead):
         input_label_embed = self.pb_embedding(known_pb_labels_expaned)
 
         # Handle text prompts if available
-        has_text = False
-        text_embeddings = None
+        # CRITICAL for DDP: Always call prompt_fusion if it exists, even without text
+        # This ensures all parameters participate in gradient computation
         if self.prompt_fusion is not None:
             # Check if any instance has text
             texts_list = []
+            has_text = False
             for inst in gt_instances:
                 if hasattr(inst, 'text') and inst.text is not None:
                     if isinstance(inst.text, list):
@@ -1121,37 +1122,31 @@ class Mask2FormerVideoHead(AnchorFreeHead):
                 else:
                     texts_list.append(None)
             
-            if has_text:
-                # Prepare point and box embeddings for fusion
-                # Point embeddings: we can use the point coordinates
-                # For now, we'll use the pb_embedding as point-like embedding
-                point_embeds = input_label_embed  # [B, N, C]
-                
-                # Box embeddings: convert boxes to embeddings
-                # We can use a simple projection or reuse bbox embedding
-                box_embeds = None  # Can be added later if needed
-                
-                # Process text for each sample in batch
-                batch_text_embeds = []
-                for i, texts in enumerate(texts_list):
-                    if texts is not None:
-                        # Fuse text with point embeddings
-                        fused = self.prompt_fusion(
-                            point_embed=point_embeds[i:i+1],  # [1, N, C]
-                            box_embed=box_embeds[i:i+1] if box_embeds is not None else None,
-                            text=texts  # List of strings
-                        )
-                        if fused is not None:
-                            batch_text_embeds.append(fused[0])  # [N, C]
-                        else:
-                            batch_text_embeds.append(point_embeds[i])
-                    else:
-                        batch_text_embeds.append(point_embeds[i])
-                
-                # Stack text embeddings
-                if batch_text_embeds:
-                    text_embeddings = torch.stack(batch_text_embeds, dim=0)  # [B, N, C]
-                    input_label_embed = text_embeddings
+            # Prepare point and box embeddings for fusion
+            point_embeds = input_label_embed  # [B, N, C]
+            box_embeds = None  # Can be added later if needed
+            
+            # Process each sample in batch
+            # CRITICAL: Always call prompt_fusion for all samples to ensure DDP compatibility
+            batch_text_embeds = []
+            for i, texts in enumerate(texts_list):
+                # Always call prompt_fusion, even if texts is None
+                # This ensures text_encoder parameters always participate in gradient computation
+                fused = self.prompt_fusion(
+                    point_embed=point_embeds[i:i+1],  # [1, N, C]
+                    box_embed=box_embeds[i:i+1] if box_embeds is not None else None,
+                    text=texts  # Can be None, but prompt_fusion will handle it
+                )
+                if fused is not None:
+                    batch_text_embeds.append(fused[0])  # [N, C]
+                else:
+                    # If fusion returns None (no prompts), use original embedding
+                    batch_text_embeds.append(point_embeds[i])
+            
+            # Stack text embeddings
+            if batch_text_embeds:
+                text_embeddings = torch.stack(batch_text_embeds, dim=0)  # [B, N, C]
+                input_label_embed = text_embeddings
 
         input_bbox_embed = inverse_sigmoid(known_bbox_expand)
 
