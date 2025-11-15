@@ -9,7 +9,7 @@ with read_base():
     from .._base_.datasets.coco_panoptic_lsj import *
     from .._base_.default_runtime import *
     from .._base_.schedules.schedule_12e import *
-    from .rap_sam_r50_12e_adaptor import model
+    from .rap_sam_r50_12e_text import model
 batch_augments = [
     dict(
         type=BatchFixedSizePad,
@@ -44,7 +44,7 @@ num_stuff_classes = 53
 model.update(
     data_preprocessor=data_preprocessor,
     panoptic_head=dict(
-        ov_classifier_name=f'{ov_model_name}_{ov_datasets_name}',
+        ov_classifier_name=f'/mnt/chenjiahui/Fastsam2-main/checkpoints/convnext_large_d_320_CocoPanopticOVDataset',
         num_things_classes=num_things_classes,
         num_stuff_classes=num_stuff_classes,
     ),

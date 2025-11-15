@@ -72,15 +72,23 @@ class SAMDataPreprocessor(DetDataPreprocessor):
                 else:
                     texts_list.append(None)
             
-            data_sample.gt_instances_collected = InstanceData(
-                point_coords=torch.stack([itm['point_coords'] for itm in gt_collected]),
-                sub_instances=[itm['instances'] for itm in gt_collected],
-                masks=torch.stack([itm['masks'] for itm in gt_collected]),
-            )
-            pb_labels = torch.ones(len(data_sample.gt_instances_collected), dtype=torch.long, device=device)
-            data_sample.gt_instances_collected.pb_labels = pb_labels
-            
-            # Add text to gt_instances_collected if available
-            if any(t is not None for t in texts_list):
-                data_sample.gt_instances_collected.text = texts_list
+            # Only create gt_instances_collected if we have collected instances
+            if len(gt_collected) > 0:
+                data_sample.gt_instances_collected = InstanceData(
+                    point_coords=torch.stack([itm['point_coords'] for itm in gt_collected]),
+                    sub_instances=[itm['instances'] for itm in gt_collected],
+                    masks=torch.stack([itm['masks'] for itm in gt_collected]),
+                )
+                pb_labels = torch.ones(len(data_sample.gt_instances_collected), dtype=torch.long, device=device)
+                data_sample.gt_instances_collected.pb_labels = pb_labels
+                
+                # Add text to gt_instances_collected if available
+                if any(t is not None for t in texts_list):
+                    data_sample.gt_instances_collected.text = texts_list
+            else:
+                # No instances, create empty gt_instances_collected
+                data_sample.gt_instances_collected = InstanceData()
+                data_sample.gt_instances_collected.point_coords = torch.empty((0, 4), dtype=torch.long, device=device)
+                data_sample.gt_instances_collected.masks = torch.empty((0, h, w), dtype=torch.bool, device=device)
+                data_sample.gt_instances_collected.pb_labels = torch.empty((0,), dtype=torch.long, device=device)
         return dict(inputs=inputs, data_samples=data_samples)

@@ -56,10 +56,22 @@ class InteractiveEvaluator(BaseMetric):
 
     def process(self, data_batch: dict, data_samples: Sequence[dict]) -> None:
         for data_sample in data_samples:
+            # Skip if no predictions or no ground truth
+            if 'pred_instances' not in data_sample or 'gt_instances_collected' not in data_sample:
+                continue
+            
+            # Check if masks exist
+            if 'masks' not in data_sample['pred_instances'] or 'masks' not in data_sample['gt_instances_collected']:
+                continue
+            
             pred_masks = data_sample['pred_instances']['masks']
-            # all_pred_mask = data_sample['all_pred_instances']['masks']
-
             gt_masks = data_sample['gt_instances_collected']['masks']
+            
+            # Skip if empty
+            if len(pred_masks) == 0 or len(gt_masks) == 0:
+                continue
+            
+            # all_pred_mask = data_sample['all_pred_instances']['masks']
             self.iou_list.extend(self.get_iou(gt_masks, pred_masks))
             # gt_masks_repeat = gt_masks.repeat_interleave(self.num_tokens, 0)
 
