@@ -127,35 +127,136 @@ class Mask2formerVideo(SingleStageDetector):
             bs = batch_inputs.shape[0]
             feats = self.extract_feat(batch_inputs)
 
-        if self.inference_sam and len(batch_data_samples[0].gt_instances_collected)==0:
-            return batch_data_samples
+        # Check if interactive mode with prompts
+        if self.inference_sam:
+            # For video, check first frame; for image, check directly
+            if isinstance(batch_data_samples[0], TrackDataSample):
+                has_prompts = len(batch_data_samples[0][0].gt_instances_collected) > 0
+            else:
+                has_prompts = len(batch_data_samples[0].gt_instances_collected) > 0
+            
+            if not has_prompts:
+                return batch_data_samples
 
         mask_cls_results, mask_pred_results, iou_results = self.panoptic_head.predict(feats, batch_data_samples)
 
         if self.inference_sam:
-            for i, data_sample in enumerate(batch_data_samples):
-                meta = data_sample.metainfo
-                img_height, img_width = meta['img_shape'][:2]
-                mask_pred_result = mask_pred_results[i][:, :img_height, :img_width]
+            # Interactive segmentation mode (supports both image and video)
+            if num_frames > 0:
+                # Video interactive segmentation: process each frame
+                for idx in range(bs):
+                    for frame_id in range(num_frames):
+                        data_sample = batch_data_samples[idx][frame_id]
+                        meta = data_sample.metainfo
+                        img_height, img_width = meta['img_shape'][:2]
+                        
+                        # Get predictions for this frame
+                        frame_mask_pred = mask_pred_results[idx, :, frame_id, :img_height, :img_width]
+                        
+                        # Interpolate to original size
+                        frame_mask_pred = F.interpolate(
+                            frame_mask_pred[None], 
+                            meta['ori_shape'], 
+                            mode="bilinear", 
+                            align_corners=False
+                        )[0]
+                        frame_mask_pred = frame_mask_pred.view(-1, meta['ori_shape'][0], meta['ori_shape'][1]) > 0
+                        
+                        # Create result
+                        results = InstanceData()
+                        if 'pred_instances' in data_sample:
+                            results.labels = data_sample.pred_instances.labels
+                            results.scores = data_sample.pred_instances.scores
+                            scale_factor = data_sample.pred_instances.bboxes.new_tensor(data_sample.scale_factor).repeat(2)
+                            results.bboxes = data_sample.pred_instances.bboxes / scale_factor
+                        results.masks = frame_mask_pred
+                        data_sample.pred_instances = results
+                
+                return batch_data_samples
+            else:
+                # Image interactive segmentation (original logic)
+                for i, data_sample in enumerate(batch_data_samples):
+                    meta = data_sample.metainfo
+                    img_height, img_width = meta['img_shape'][:2]
+                    mask_pred_result = mask_pred_results[i][:, :img_height, :img_width]
 
-                mask_pred_result = F.interpolate(mask_pred_result[None], meta['ori_shape'], mode="bilinear", align_corners=False)[0]
-                mask_pred_result = mask_pred_result.view(-1, meta['ori_shape'][0], meta['ori_shape'][1]) > 0
-                # mask_pred_result = mask_pred_result.view(-1, img_height, img_width) > 0
-                results = InstanceData()
-                if 'pred_instances' in data_sample:
-                    results.labels = data_sample.pred_instances.labels
-                    results.scores = data_sample.pred_instances.scores
-                    scale_factor = data_sample.pred_instances.bboxes.new_tensor(data_sample.scale_factor).repeat(2)
-                    results.bboxes = data_sample.pred_instances.bboxes / scale_factor
-                results.masks = mask_pred_result
-                data_sample.pred_instances = results
-            return batch_data_samples
+                    mask_pred_result = F.interpolate(mask_pred_result[None], meta['ori_shape'], mode="bilinear", align_corners=False)[0]
+                    mask_pred_result = mask_pred_result.view(-1, meta['ori_shape'][0], meta['ori_shape'][1]) > 0
+                    results = InstanceData()
+                    if 'pred_instances' in data_sample:
+                        results.labels = data_sample.pred_instances.labels
+                        results.scores = data_sample.pred_instances.scores
+                        scale_factor = data_sample.pred_instances.bboxes.new_tensor(data_sample.scale_factor).repeat(2)
+                        results.bboxes = data_sample.pred_instances.bboxes / scale_factor
+                    results.masks = mask_pred_result
+                    data_sample.pred_instances = results
+                return batch_data_samples
 
         if self.OVERLAPPING is not None:
             assert len(self.OVERLAPPING) == self.num_classes
             mask_cls_results = self.open_voc_inference(feats, mask_cls_results, mask_pred_results)
 
-        if num_frames > 0:
+        # Check for VOS mode: video data with instance_ids in first frame
+        is_vos_mode = False
+        if num_frames > 0 and isinstance(batch_data_samples[0], TrackDataSample):
+            # Check if first frame has instance_ids (VOS task)
+            first_frame_sample = batch_data_samples[0][0]
+            if hasattr(first_frame_sample, 'gt_instances') and \
+               hasattr(first_frame_sample.gt_instances, 'instances_ids'):
+                is_vos_mode = True
+        
+        if is_vos_mode:
+            # VOS mode: Match first frame GT masks to predictions, then track
+            # First frame: match GT masks to predictions
+            first_frame_sample = batch_data_samples[0][0]
+            gt_masks = first_frame_sample.gt_instances.masks
+            gt_instance_ids = first_frame_sample.gt_instances.instances_ids
+            
+            # Get first frame predictions (before threshold)
+            first_frame_masks = (mask_pred_results[0, :, 0] > 0).float()  # [N_queries, H, W]
+            
+            # Match GT to predictions
+            matched_indices, matched_instance_ids = self._vos_first_frame_match(
+                gt_masks=gt_masks,
+                gt_instance_ids=gt_instance_ids,
+                pred_masks=first_frame_masks,
+                iou_threshold=0.5
+            )
+            
+            # Filter predictions to only matched queries
+            if len(matched_indices) > 0:
+                mask_cls_results = mask_cls_results[:, matched_indices]  # [bs, N_matched, num_classes]
+                mask_pred_results = mask_pred_results[:, matched_indices]  # [bs, N_matched, T, H, W]
+                iou_results = iou_results[:, matched_indices]  # [bs, N_matched]
+            else:
+                # No matches found, return empty results
+                for idx in range(bs):
+                    for frame_id in range(num_frames):
+                        data_sample = batch_data_samples[idx][frame_id]
+                        data_sample.pred_track_instances = InstanceData()
+                        data_sample.pred_track_instances.instances_id = torch.tensor([], dtype=torch.long)
+                return batch_data_samples
+            
+            # Process all frames with tracked queries
+            for frame_id in range(num_frames):
+                results_list_img = self.panoptic_fusion_head.predict(
+                    mask_cls_results,
+                    mask_pred_results[:, :, frame_id],
+                    [batch_data_samples[idx][frame_id] for idx in range(bs)],
+                    rescale=rescale
+                )
+                # Add instance IDs from VOS matching
+                for i, (data_sample, pred_results) in enumerate(zip(
+                    [batch_data_samples[idx][frame_id] for idx in range(bs)], results_list_img
+                )):
+                    if 'ins_results' in pred_results:
+                        pred_results['ins_results']['instances_id'] = matched_instance_ids
+                        data_sample.pred_track_instances = pred_results['ins_results']
+            
+            results = batch_data_samples
+        
+        elif num_frames > 0:
+            # Regular video mode (VIS, video panoptic, etc.)
             for frame_id in range(num_frames):
                 results_list_img = self.panoptic_fusion_head.predict(
                     mask_cls_results,
@@ -238,6 +339,60 @@ class Mask2formerVideo(SingleStageDetector):
             assert 'sem_results' not in pred_results
 
         return data_samples
+    
+    def _vos_first_frame_match(
+        self,
+        gt_masks: torch.Tensor,
+        gt_instance_ids: torch.Tensor,
+        pred_masks: torch.Tensor,
+        iou_threshold: float = 0.5
+    ) -> tuple:
+        """Match GT masks with predicted masks using IoU for VOS first frame.
+        
+        Args:
+            gt_masks: Ground truth masks [N_gt, H, W]
+            gt_instance_ids: Ground truth instance IDs [N_gt]
+            pred_masks: Predicted masks [N_pred, H, W]
+            iou_threshold: Minimum IoU threshold for matching
+            
+        Returns:
+            tuple: (matched_indices, matched_instance_ids)
+                - matched_indices: Indices of matched predictions [N_matched]
+                - matched_instance_ids: Corresponding GT instance IDs [N_matched]
+        """
+        from scipy.optimize import linear_sum_assignment
+        
+        # Compute IoU matrix: [N_gt, N_pred]
+        gt_masks_flat = gt_masks.flatten(1).float()  # [N_gt, H*W]
+        pred_masks_flat = pred_masks.flatten(1).float()  # [N_pred, H*W]
+        
+        # Intersection and Union
+        intersection = torch.mm(gt_masks_flat, pred_masks_flat.t())  # [N_gt, N_pred]
+        gt_area = gt_masks_flat.sum(dim=1, keepdim=True)  # [N_gt, 1]
+        pred_area = pred_masks_flat.sum(dim=1, keepdim=True)  # [N_pred, 1]
+        union = gt_area + pred_area.t() - intersection  # [N_gt, N_pred]
+        
+        iou_matrix = intersection / (union + 1e-6)  # [N_gt, N_pred]
+        
+        # Convert to cost matrix for Hungarian algorithm
+        cost_matrix = 1.0 - iou_matrix.cpu().numpy()
+        
+        # Hungarian matching
+        gt_indices, pred_indices = linear_sum_assignment(cost_matrix)
+        
+        # Filter by IoU threshold
+        matched_indices = []
+        matched_instance_ids = []
+        
+        for gt_idx, pred_idx in zip(gt_indices, pred_indices):
+            if iou_matrix[gt_idx, pred_idx] >= iou_threshold:
+                matched_indices.append(pred_idx)
+                matched_instance_ids.append(gt_instance_ids[gt_idx].item())
+        
+        matched_indices = torch.tensor(matched_indices, dtype=torch.long, device=pred_masks.device)
+        matched_instance_ids = torch.tensor(matched_instance_ids, dtype=gt_instance_ids.dtype, device=pred_masks.device)
+        
+        return matched_indices, matched_instance_ids
 
     def _forward(
             self,
