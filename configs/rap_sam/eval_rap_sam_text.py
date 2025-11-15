@@ -77,10 +77,14 @@ val_evaluator = [
     dict(
         type=InteractiveEvaluator,
         num_tokens=1,
-        format_only=False,
+        #format_only=False,
     )
 ]
 test_evaluator = val_evaluator
+
+# Val config (required by MMEngine)
+val_cfg = dict(type='mmengine.runner.ValLoop')
+test_cfg = dict(type='mmengine.runner.TestLoop')
 
 # 更新模型配置
 model.update(

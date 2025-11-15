@@ -131,9 +131,11 @@ class Mask2formerVideo(SingleStageDetector):
         if self.inference_sam:
             # For video, check first frame; for image, check directly
             if isinstance(batch_data_samples[0], TrackDataSample):
-                has_prompts = len(batch_data_samples[0][0].gt_instances_collected) > 0
+                has_prompts = hasattr(batch_data_samples[0][0], 'gt_instances_collected') and \
+                             len(batch_data_samples[0][0].gt_instances_collected) > 0
             else:
-                has_prompts = len(batch_data_samples[0].gt_instances_collected) > 0
+                has_prompts = hasattr(batch_data_samples[0], 'gt_instances_collected') and \
+                             len(batch_data_samples[0].gt_instances_collected) > 0
             
             if not has_prompts:
                 return batch_data_samples

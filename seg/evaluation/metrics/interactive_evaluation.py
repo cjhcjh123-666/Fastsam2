@@ -84,6 +84,15 @@ class InteractiveEvaluator(BaseMetric):
             vals = iou_arr >= iou_thr
             return 1 if vals else self.max_clicks
 
+        # Handle empty iou_list
+        if len(iou_list) == 0:
+            # Return default values if no samples
+            pred_noc = {}
+            for iou_thr in self.all_ious:
+                pred_noc[str(iou_thr)] = self.max_clicks
+            pred_noc['iou_max_iter'] = 0.0
+            return pred_noc
+
         noc_list = {}
         for iou_thr in self.all_ious:
             scores_arr = [
@@ -97,8 +106,14 @@ class InteractiveEvaluator(BaseMetric):
         num_samples = len(iou_list)
         pred_noc =  {}
         for key, value in noc_list.items():
-            pred_noc[key] = sum(value) * 1.0 / len(value)
-        pred_noc['iou_max_iter'] = sum(iou_before_max_iter) / num_samples
+            if len(value) > 0:
+                pred_noc[key] = sum(value) * 1.0 / len(value)
+            else:
+                pred_noc[key] = self.max_clicks
+        if num_samples > 0:
+            pred_noc['iou_max_iter'] = sum(iou_before_max_iter) / num_samples
+        else:
+            pred_noc['iou_max_iter'] = 0.0
 
         return pred_noc
 
