@@ -1035,7 +1035,11 @@ class Mask2FormerVideoHead(AnchorFreeHead):
             img_shape = data_sample[0].metainfo['batch_input_shape']
             num_frames = len(data_sample)
         else:
-            if 'gt_instances_collected' in data_sample:
+            # 检查是否有 gt_instances_collected 且不为空
+            if hasattr(data_sample, 'gt_instances_collected') and \
+               data_sample.gt_instances_collected is not None and \
+               hasattr(data_sample.gt_instances_collected, 'point_coords') and \
+               len(data_sample.gt_instances_collected.point_coords) > 0:
                 self.prompt_training = True
             img_shape = data_sample.metainfo['batch_input_shape']
             num_frames = 0

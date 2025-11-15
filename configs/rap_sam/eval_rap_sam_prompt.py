@@ -13,7 +13,7 @@ from mmdet.datasets.transforms import LoadPanopticAnnotations, RandomFlip, Rando
 
 from seg.datasets.coco_ov import CocoPanopticOVDataset
 from seg.datasets.pipelines.loading import FilterAnnotationsHB
-from seg.datasets.pipelines.formatting import GeneratePoint
+from seg.datasets.pipelines.formatting import GeneratePoint, GenerateText
 from seg.datasets.pipelines.loading import LoadPanopticAnnotationsAll
 from mmcv.transforms import LoadImageFromFile, RandomResize
 
@@ -53,9 +53,9 @@ test_pipeline = [
     dict(type=LoadImageFromFile),
     dict(type=LoadPanopticAnnotationsAll),
     dict(type=Resize, scale=(1333, 800), keep_ratio=True),
-    dict(
-        type=PackDetInputs,
-    )
+    dict(type=PackDetInputs),
+    dict(type=GeneratePoint, num_proposals=100, num_mask_tokens=1),
+    dict(type=GenerateText, use_class_names=True),
 ]
 
 val_dataloader = dict(

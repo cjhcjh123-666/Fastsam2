@@ -315,12 +315,12 @@ class GeneratePoint(BaseTransform):
 
 @TRANSFORMS.register_module()
 class GenerateText(BaseTransform):
-    """Generate text prompts from metainfo, similar to GeneratePoint.
+    """Generate text prompts from metainfo or class names.
     
     If text exists in metainfo (e.g., from RefCOCO), use it.
-    Otherwise, generate text from class labels.
+    Otherwise, generate text from class labels using dataset metainfo.
     """
-    def __init__(self, use_class_names=False):
+    def __init__(self, use_class_names=True):
         self.use_class_names = use_class_names
     
     def transform(self, results):
@@ -330,28 +330,70 @@ class GenerateText(BaseTransform):
         # 从 metainfo 中获取文本（RefCOCO数据集会提供）
         text = data_samples.metainfo.get('text', None)
         
-        # 如果没有文本，从类别名称生成（可选）
+        # 如果没有文本，从类别名称生成
         if text is None and self.use_class_names:
-            # 从类别ID生成文本描述
             if hasattr(gt_instances, 'labels') and len(gt_instances.labels) > 0:
-                # 这里可以添加类别到文本的映射
-                text = "object"  # 默认文本
+                # 从数据集的 metainfo 获取类别名称
+                classes = data_samples.metainfo.get('classes', None)
+                # 如果 metainfo 中没有，尝试从 CocoPanopticOVDataset 的 METAINFO 获取
+                if classes is None:
+                    # 尝试导入并使用 CocoPanopticOVDataset 的 METAINFO
+                    try:
+                        from seg.datasets.coco_ov import CocoPanopticOVDataset
+                        classes = CocoPanopticOVDataset.METAINFO.get('classes', None)
+                    except (ImportError, AttributeError):
+                        pass
+                
+                if classes is not None:
+                    # 为每个实例生成文本（使用类别名称的第一个词）
+                    texts_list = []
+                    labels = gt_instances.labels
+                    if isinstance(labels, torch.Tensor):
+                        labels = labels.cpu().numpy()
+                    
+                    for label_id in labels:
+                        if 0 <= label_id < len(classes):
+                            class_name = classes[label_id]
+                            # 取类别名称的第一个词（如果有逗号分隔，取第一个）
+                            if ',' in class_name:
+                                class_name = class_name.split(',')[0].strip()
+                            texts_list.append(class_name)
+                        else:
+                            texts_list.append("object")
+                    
+                    # 将文本添加到 gt_instances
+                    if not hasattr(gt_instances, 'text'):
+                        gt_instances.text = texts_list
+                    else:
+                        # 如果已有文本，合并
+                        if isinstance(gt_instances.text, list):
+                            gt_instances.text = texts_list
+                        else:
+                            gt_instances.text = texts_list
         
-        # 将文本添加到 gt_instances_collected（如果已存在）或创建新的
-        if not hasattr(data_samples, 'gt_instances_collected'):
-            data_samples.gt_instances_collected = InstanceData()
-        
-        # 为每个实例存储文本（如果有多个实例，使用相同的文本或生成多个）
-        num_instances = len(gt_instances) if hasattr(gt_instances, '__len__') else 1
-        if text is not None:
-            # 存储文本字符串列表（每个prompt对应一个文本）
-            if not hasattr(data_samples.gt_instances_collected, 'text'):
-                data_samples.gt_instances_collected.text = []
-            # 为每个prompt添加文本（与point_coords的数量对应）
-            if hasattr(data_samples.gt_instances_collected, 'point_coords'):
-                num_prompts = len(data_samples.gt_instances_collected.point_coords)
-                data_samples.gt_instances_collected.text = [text] * num_prompts
-            else:
-                data_samples.gt_instances_collected.text = [text] * num_instances
+        # 将文本添加到 gt_instances_collected（如果已存在）
+        if hasattr(data_samples, 'gt_instances_collected'):
+            if hasattr(gt_instances, 'text') and gt_instances.text is not None:
+                # 如果 gt_instances_collected 已有 point_coords，为每个点匹配对应的文本
+                if hasattr(data_samples.gt_instances_collected, 'point_coords'):
+                    num_prompts = len(data_samples.gt_instances_collected.point_coords)
+                    # 如果有 idx 属性，使用它来匹配文本
+                    if hasattr(data_samples.gt_instances_collected, 'idx'):
+                        idx = data_samples.gt_instances_collected.idx
+                        if isinstance(idx, torch.Tensor):
+                            idx = idx.cpu().numpy()
+                        texts_for_prompts = []
+                        for i in idx:
+                            if i < len(gt_instances.text):
+                                texts_for_prompts.append(gt_instances.text[i])
+                            else:
+                                texts_for_prompts.append(gt_instances.text[0] if len(gt_instances.text) > 0 else "object")
+                        data_samples.gt_instances_collected.text = texts_for_prompts
+                    else:
+                        # 如果没有 idx，使用第一个文本或重复
+                        if isinstance(gt_instances.text, list) and len(gt_instances.text) > 0:
+                            data_samples.gt_instances_collected.text = [gt_instances.text[0]] * num_prompts
+                        else:
+                            data_samples.gt_instances_collected.text = ["object"] * num_prompts
         
         return results

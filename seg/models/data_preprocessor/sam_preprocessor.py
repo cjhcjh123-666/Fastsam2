@@ -20,6 +20,14 @@ class SAMDataPreprocessor(DetDataPreprocessor):
         if training:
             return dict(inputs=inputs, data_samples=data_samples)
         for data_sample in data_samples:
+            # 如果 pipeline 已经生成了 gt_instances_collected，直接使用它
+            if hasattr(data_sample, 'gt_instances_collected') and \
+               data_sample.gt_instances_collected is not None and \
+               hasattr(data_sample.gt_instances_collected, 'point_coords') and \
+               len(data_sample.gt_instances_collected.point_coords) > 0:
+                # Pipeline 已经生成了提示，直接使用
+                continue
+            
             gt_instances = data_sample.gt_instances
             
             device = gt_instances.labels.device
