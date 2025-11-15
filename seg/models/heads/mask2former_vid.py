@@ -944,7 +944,10 @@ class Mask2FormerVideoHead(AnchorFreeHead):
         batch_gt_instances = []
         batch_gt_semantic_segs = []
 
-        if batch_data_samples[0].get('data_tag', 'coco') == 'sam':
+        # Check if this is an interactive segmentation task (SAM, RefCOCO, etc.)
+        data_tag = batch_data_samples[0].get('data_tag', 'coco')
+        # Interactive tasks: 'sam' (point/box prompts), 'refcoco' (text prompts)
+        if data_tag in ['sam', 'refcoco']:
             self.prompt_training = True
         else:
             self.prompt_training = False

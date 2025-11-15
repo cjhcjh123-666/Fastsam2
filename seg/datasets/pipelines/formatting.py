@@ -306,6 +306,10 @@ class GeneratePoint(BaseTransform):
             sub_instances=[itm['instances'] for itm in gt_collected],
             idx=torch.tensor(valid_indices, dtype=torch.long) if len(valid_indices) > 0 else torch.tensor([0], dtype=torch.long)
         )
+        # Set pb_labels (point/box labels: 1 for positive prompts)
+        device = data_samples.gt_instances_collected.point_coords.device
+        pb_labels = torch.ones(len(data_samples.gt_instances_collected), dtype=torch.long, device=device)
+        data_samples.gt_instances_collected.pb_labels = pb_labels
         return results
 
 

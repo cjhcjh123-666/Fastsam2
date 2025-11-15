@@ -8,7 +8,8 @@ from mmdet.models.backbones import ResNet
 from seg.models.necks.ramsam_neck import YOSONeck
 from seg.models.heads.rapsam_head import RapSAMVideoHead
 from seg.models.detectors.rapsam import RapSAM
-from seg.models.backbones import OpenCLIPBackbone
+
+from seg.models.backbones.openclip_backbone import OpenCLIPBackboneText  # Import to register
 from seg.models.data_preprocessor.vid_sam_preprocessor import VideoPromptDataPreprocessor
 with read_base():
     from .._base_.default_runtime import *
@@ -40,20 +41,40 @@ data_preprocessor = dict(
     batch_augments=batch_augments
 )
 
-num_things_classes = 145
-num_stuff_classes = 102
+prompt_fusion = dict(
+    type='PromptFusion',
+    feat_channels=256,
+    num_heads=8,
+    dropout=0.1,
+    use_text_encoder=True,
+    text_encoder=dict(
+        type='TextEncoder',
+        feat_channels=256,
+        # text_model_cfg can be added here for CLIP text encoder
+        # Example:
+        text_model_cfg=dict(
+            type=OpenCLIPBackboneText,
+            model_name='ViT-L-14',
+            init_cfg=dict(type='clip_pretrain', checkpoint='/mnt/chenjiahui/Fastsam2-main/checkpoints/openclip_vitl14_pretrain.pt')
+        )
+    )
+)
+
+num_things_classes = 100
+num_stuff_classes = 53
 num_classes = num_things_classes + num_stuff_classes
 model = dict(
     type=RapSAM,
     data_preprocessor=data_preprocessor,
     backbone=dict(
-        type=OpenCLIPBackbone,
-        model_name='convnext_large_d_320',
-        fix=True,
-        init_cfg=dict(
-            type='clip_pretrain',
-            checkpoint='laion2b_s29b_b131k_ft_soup'
-        )
+        type=ResNet,
+        depth=50,
+        num_stages=4,
+        out_indices=(0, 1, 2, 3),
+        frozen_stages=-1,
+        norm_cfg=dict(type='BN', requires_grad=True),
+        norm_eval=True,
+        init_cfg=dict(type='Pretrained', checkpoint='/mnt/chenjiahui/Fastsam2-main/checkpoints/resnet50-0676ba61.pth'),
     ),
     neck=dict(
         type=YOSONeck,
@@ -68,7 +89,9 @@ model = dict(
         use_adaptor=True,
         use_kernel_updator=True,
         sphere_cls=True,
-        ov_classifier_name='convnext_large_d_320_Concat_CocoPanopticOVDataset_YouTubeVISDataset_2019_YouTubeVISDataset_2021_VIPSegDataset_CityscapesPanopticDataset',
+        # Enable text prompt fusion in head
+        prompt_fusion=prompt_fusion,
+        ov_classifier_name='convnext_large_d_320_Concat_CocoPanopticOVDataset_YouTubeVISDataset_2021',
         num_stages=3,
         feat_channels=256,
         num_things_classes=num_things_classes,
@@ -129,3 +152,6 @@ model = dict(
 val_dataloader = None
 val_evaluator = None
 val_cfg = None
+test_dataloader = val_dataloader
+test_evaluator = val_evaluator
+test_cfg = val_cfg

@@ -61,8 +61,25 @@ class RapSAMVideoHead(Mask2FormerVideoHead):
                  init_cfg: OptMultiConfig = None,
                  matching_whole_map: bool = False,
                  enable_box_query: bool = False,
+                 # text prompt support
+                 prompt_fusion: OptConfigType = None,
                  **kwargs) -> None:
+        # Initialize parent class (Mask2FormerVideoHead) to get prompt_fusion support
+        # But we need to be careful not to override RapSAMVideoHead's custom initialization
+        # So we'll call AnchorFreeHead directly and manually initialize prompt_fusion
         super(AnchorFreeHead, self).__init__(init_cfg=init_cfg)
+        
+        # Initialize prompt_fusion if provided (from Mask2FormerVideoHead)
+        if prompt_fusion is not None:
+            import copy
+            from mmdet.registry import MODELS
+            prompt_fusion_ = copy.deepcopy(prompt_fusion)
+            if 'feat_channels' not in prompt_fusion_:
+                prompt_fusion_['feat_channels'] = feat_channels
+            self.prompt_fusion = MODELS.build(prompt_fusion_)
+        else:
+            self.prompt_fusion = None
+        
         self.prompt_with_kernel_updator = prompt_with_kernel_updator
         self.panoptic_with_kernel_updator = panoptic_with_kernel_updator
         self.use_adaptor = use_adaptor

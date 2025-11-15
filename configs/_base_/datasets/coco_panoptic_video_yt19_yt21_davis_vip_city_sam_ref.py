@@ -22,7 +22,7 @@ from mmdet.datasets.transforms import LoadPanopticAnnotations, LoadAnnotations, 
 from seg.datasets.coco_ov import CocoPanopticOVDataset
 from seg.datasets.ref_seg import RefSegDataset
 from seg.datasets.pipelines.loading import FilterAnnotationsHB
-from seg.datasets.pipelines.formatting import GeneratePoint
+from seg.datasets.pipelines.formatting import GeneratePoint, GenerateText
 from seg.datasets.pipelines.loading import LoadPanopticAnnotationsAll
 
 data_root = 'data/coco/'
@@ -90,7 +90,9 @@ refcoco_dataset = dict(
         dict(type=PackDetInputs,
              meta_keys=('img_id','img_path','ori_shape','img_shape','scale_factor','text')),
         # generate point prompts from gt masks to align with current prompt pipeline
-        dict(type=GeneratePoint, num_proposals=30, num_mask_tokens=num_mask_tokens)
+        dict(type=GeneratePoint, num_proposals=30, num_mask_tokens=num_mask_tokens),
+        # generate text prompts from metainfo (RefCOCO provides text in metainfo)
+        dict(type=GenerateText, use_class_names=False)
     ],
     backend_args=backend_args
 )
