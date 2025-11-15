@@ -34,6 +34,12 @@ class TextEncoder(nn.Module):
         if text_model_cfg is not None:
             # Build text model from config (e.g., CLIP text encoder)
             self.text_model = MODELS.build(text_model_cfg)
+            
+            # CRITICAL: Ensure text_model parameters require gradients for training
+            # Even if it has @torch.no_grad() decorator, we need gradients for fine-tuning
+            for param in self.text_model.parameters():
+                param.requires_grad = True
+            
             # Project text features to feat_channels if needed
             if hasattr(self.text_model, 'embed_dim'):
                 text_dim = self.text_model.embed_dim
@@ -84,9 +90,10 @@ class TextEncoder(nn.Module):
                     if hasattr(self.text_model, 'text_tokenizer'):
                         # Create a dummy text string and tokenize it
                         dummy_text = [""]  # Empty string
-                        dummy_tokens = self.text_model.text_tokenizer(dummy_text).to(device)
-                        # Encode the dummy tokens
-                        text_embed = self.text_model(dummy_text)
+                        # CRITICAL: OpenCLIPBackboneText.forward has @torch.no_grad() decorator
+                        # We need to override it with enable_grad() for training
+                        with torch.enable_grad():
+                            text_embed = self.text_model(dummy_text)
                         # Project - DON'T multiply by 0 as it blocks gradients
                         if text_embed.dim() == 2:
                             text_embed = text_embed.unsqueeze(1)
@@ -111,20 +118,18 @@ class TextEncoder(nn.Module):
             # 1. Tokenize strings using CLIP tokenizer
             # 2. Encode tokens using text_model
             if self.text_model is not None and hasattr(self.text_model, 'text_tokenizer'):
-                # Tokenize
-                tokenized = []
-                for txt in text:
-                    tokens = self.text_model.text_tokenizer(txt)
-                    tokenized.append(tokens)
-                text_tokens = torch.stack(tokenized)
-                # Encode
-                text_embed = self.text_model(text_tokens)
+                # CRITICAL: Override @torch.no_grad() decorator with enable_grad()
+                with torch.enable_grad():
+                    # Encode - text_model can handle list of strings directly
+                    text_embed = self.text_model(text)
             else:
                 return None
         elif self.text_model is not None:
             # Use text model to encode
             if text.dim() == 2:  # Token IDs
-                text_embed = self.text_model(text)  # [B, C] or [B, L, C]
+                # CRITICAL: Override @torch.no_grad() decorator with enable_grad()
+                with torch.enable_grad():
+                    text_embed = self.text_model(text)  # [B, C] or [B, L, C]
             else:  # Already embeddings
                 text_embed = text
         else:
