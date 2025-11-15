@@ -35,10 +35,10 @@ class TextEncoder(nn.Module):
             # Build text model from config (e.g., CLIP text encoder)
             self.text_model = MODELS.build(text_model_cfg)
             
-            # CRITICAL: Ensure text_model parameters require gradients for training
-            # Even if it has @torch.no_grad() decorator, we need gradients for fine-tuning
+            # CRITICAL: Freeze text_model - use pre-trained CLIP as-is
+            # No fine-tuning needed for text interaction functionality
             for param in self.text_model.parameters():
-                param.requires_grad = True
+                param.requires_grad = False
             
             # Project text features to feat_channels if needed
             if hasattr(self.text_model, 'embed_dim'):
@@ -70,66 +70,32 @@ class TextEncoder(nn.Module):
         Returns:
             Text embeddings [B, N_text, C] or None.
         """
-        # CRITICAL for DDP: Even when text is None, we must call text_model with dummy input
-        # to ensure all parameters participate in gradient computation
+        # Handle None input - create dummy embedding for DDP compatibility
         if text is None:
             if self.text_model is not None:
-                # Create a dummy text input to ensure parameters participate in gradient computation
-                # For OpenCLIPBackboneText, we need actual tokenized text
-                # Safely get device from text_model or text_proj
-                try:
-                    device = next(self.text_model.parameters()).device
-                except StopIteration:
-                        device = next(self.text_proj.parameters()).device
-                
-                # Try to create a dummy token sequence
-                # For CLIP models, we can use a padding token (usually 0) or EOS token
-                # Create a minimal valid token sequence: [B=1, L=1] with padding token
-                try:
-                    # Try to get tokenizer to create proper dummy tokens
-                    if hasattr(self.text_model, 'text_tokenizer'):
-                        # Create a dummy text string and tokenize it
-                        dummy_text = [""]  # Empty string
-                        # CRITICAL: OpenCLIPBackboneText.forward has @torch.no_grad() decorator
-                        # We need to override it with enable_grad() for training
-                        with torch.enable_grad():
-                            text_embed = self.text_model(dummy_text)
-                        # Project - DON'T multiply by 0 as it blocks gradients
-                        if text_embed.dim() == 2:
-                            text_embed = text_embed.unsqueeze(1)
-                        text_embed = self.text_proj(text_embed)
-                        # Return the embedding - caller will handle it appropriately
-                        return text_embed
-                    else:
-                        # Fallback: return None but this might cause DDP issues
-                        # In this case, the caller should handle it
-                        return None
-                except Exception:
-                    # If anything fails, return None
-                    # The caller (PromptFusion) should handle this
-                    return None
+                # Since text_model is frozen, @torch.no_grad() is fine
+                # Use empty string as dummy input
+                dummy_text = [""]
+                text_embed = self.text_model(dummy_text)
+                if text_embed.dim() == 2:
+                    text_embed = text_embed.unsqueeze(1)
+                text_embed = self.text_proj(text_embed)
+                return text_embed
             return None
         
-        # Handle list of strings - would need tokenizer
+        # Handle list of strings or tensors
         if isinstance(text, list):
-            # If text_model is available and has tokenizer, use it
-            # For now, return None as placeholder
-            # In practice, this should:
-            # 1. Tokenize strings using CLIP tokenizer
-            # 2. Encode tokens using text_model
-            if self.text_model is not None and hasattr(self.text_model, 'text_tokenizer'):
-                # CRITICAL: Override @torch.no_grad() decorator with enable_grad()
-                with torch.enable_grad():
-                    # Encode - text_model can handle list of strings directly
-                    text_embed = self.text_model(text)
+            # Text is list of strings
+            if self.text_model is not None:
+                # Since text_model is frozen, @torch.no_grad() is fine
+                text_embed = self.text_model(text)
             else:
                 return None
         elif self.text_model is not None:
             # Use text model to encode
-            if text.dim() == 2:  # Token IDs
-                # CRITICAL: Override @torch.no_grad() decorator with enable_grad()
-                with torch.enable_grad():
-                    text_embed = self.text_model(text)  # [B, C] or [B, L, C]
+            if text.dim() == 2:  # Token IDs (not commonly used)
+                # Since text_model is frozen, @torch.no_grad() is fine
+                text_embed = self.text_model(text)
             else:  # Already embeddings
                 text_embed = text
         else:
