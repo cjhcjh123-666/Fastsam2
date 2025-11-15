@@ -87,10 +87,11 @@ class TextEncoder(nn.Module):
                         dummy_tokens = self.text_model.text_tokenizer(dummy_text).to(device)
                         # Encode the dummy tokens
                         text_embed = self.text_model(dummy_text)
-                        # Project but multiply by 0 to not affect output
+                        # Project - DON'T multiply by 0 as it blocks gradients
                         if text_embed.dim() == 2:
                             text_embed = text_embed.unsqueeze(1)
-                        text_embed = self.text_proj(text_embed) * 0.0  # Zero out to not affect output
+                        text_embed = self.text_proj(text_embed)
+                        # Return the embedding - caller will handle it appropriately
                         return text_embed
                     else:
                         # Fallback: return None but this might cause DDP issues
@@ -219,11 +220,10 @@ class PromptFusion(nn.Module):
             elif text is None and text_embed is None:
                 # CRITICAL: Always call text_encoder even with None to ensure parameters participate
                 # This creates a dummy embedding that ensures gradient flow
-                dummy_text_embed = self.text_encoder(None)
-                # If dummy_text_embed is not None, we'll use it (multiplied by 0 to not affect output)
-                # If it's None, we'll handle it below
-                if dummy_text_embed is not None:
-                    text_embed = dummy_text_embed * 0.0  # Zero out to not affect output but maintain gradient flow
+                text_embed = self.text_encoder(None)
+                # Don't multiply by 0 as it blocks gradients!
+                # The dummy embedding (from empty string) will naturally have minimal impact
+                # through cross-attention while maintaining gradient flow
         
         # Strategy: Use text to enhance point/box embeddings via cross-attention
         # This maintains the number of queries (points/boxes) while incorporating text information
