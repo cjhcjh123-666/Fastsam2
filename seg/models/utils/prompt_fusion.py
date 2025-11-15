@@ -64,7 +64,11 @@ class TextEncoder(nn.Module):
             if self.text_model is not None:
                 # Create a dummy text input to ensure parameters participate in gradient computation
                 # For OpenCLIPBackboneText, we need actual tokenized text
-                device = next(self.text_proj.parameters()).device
+                # Safely get device from text_model or text_proj
+                try:
+                    device = next(self.text_model.parameters()).device
+                except StopIteration:
+                        device = next(self.text_proj.parameters()).device
                 
                 # Try to create a dummy token sequence
                 # For CLIP models, we can use a padding token (usually 0) or EOS token
