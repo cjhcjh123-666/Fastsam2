@@ -35,7 +35,7 @@ optim_wrapper = dict(
     type=OptimWrapper,
     optimizer=dict(
         type=AdamW,
-        lr=0.0001,
+        lr=0.0002,
         weight_decay=0.05,
         eps=1e-8,
         betas=(0.9, 0.999)
@@ -56,4 +56,4 @@ optim_wrapper = dict(
 #   - `enable` means enable scaling LR automatically
 #       or not by default.
 #   - `base_batch_size` = (8 GPUs) x (2 samples per GPU).
-auto_scale_lr = dict(enable=True, base_batch_size=16)
+auto_scale_lr = dict(enable=False, base_batch_size=1)

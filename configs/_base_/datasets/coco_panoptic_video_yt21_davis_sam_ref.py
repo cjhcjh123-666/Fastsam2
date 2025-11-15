@@ -56,8 +56,8 @@ sam_dataset = dict(
 # 联合数据集配置
 # 包含所有8个数据集: coco, yt19, yt21, davis, vip, city, sam, refcoco
 train_dataloader = dict(
-    batch_size=2,
-    num_workers=4,
+    batch_size=1,
+    num_workers=2,
     persistent_workers=True,
     sampler=dict(type=DefaultSampler, shuffle=True),
     batch_sampler=dict(type=VideoSegAspectRatioBatchSampler),
