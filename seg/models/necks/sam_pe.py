@@ -1,15 +1,17 @@
-from typing import Tuple, Literal
+from typing import Tuple, Literal, Optional, Union, List
 
 import torch
 from mmengine import MMLogger
 
 from mmdet.registry import MODELS
+from mmdet.utils import ConfigType, OptConfigType
 from mmengine.model import BaseModule
 from mmengine.structures import InstanceData
 
 from ext.sam import PromptEncoder
 from ext.meta.sam_meta import meta_dict, checkpoint_dict
 from seg.models.utils.load_checkpoint import load_checkpoint_with_prefix
+from seg.models.utils.prompt_fusion import PromptFusion
 
 
 @MODELS.register_module()
@@ -20,6 +22,8 @@ class SAMPromptEncoder(BaseModule):
             model_name: Literal['vit_h', 'vit_l', 'vit_b'] = 'vit_h',
             fix: bool = True,
             init_cfg=None,
+            use_text_prompt: bool = False,
+            prompt_fusion: OptConfigType = None,
     ):
         assert init_cfg is not None and init_cfg['type'] == 'sam_pretrain', f"{init_cfg['type']} is not supported."
         pretrained = init_cfg['checkpoint']
@@ -56,6 +60,19 @@ class SAMPromptEncoder(BaseModule):
         # point encoding
         self.point_embeddings = prompt_encoder.point_embeddings
         self.not_a_point_embed = prompt_encoder.not_a_point_embed
+
+        # Text prompt support
+        self.use_text_prompt = use_text_prompt
+        if use_text_prompt:
+            if prompt_fusion is None:
+                prompt_fusion = dict(
+                    type='PromptFusion',
+                    feat_channels=self.embed_dim,
+                    use_text_encoder=True,
+                )
+            self.prompt_fusion = MODELS.build(prompt_fusion)
+        else:
+            self.prompt_fusion = None
 
         self.fix = fix
         if self.fix:
@@ -126,8 +143,10 @@ class SAMPromptEncoder(BaseModule):
             with_points: bool = False,
             with_bboxes: bool = False,
             with_masks: bool = False,
+            with_text: bool = False,
+            text: Optional[Union[torch.Tensor, List[str]]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert with_points or with_bboxes or with_masks
+        assert with_points or with_bboxes or with_masks or with_text
         bs = len(instances)
         
         # Determine device from input data
@@ -138,7 +157,11 @@ class SAMPromptEncoder(BaseModule):
         else:
             device = self.device
         
+        # Encode point, box, and mask prompts (original SAM prompts)
         sparse_embeddings = torch.empty((bs, 0, self.embed_dim), device=device)
+        point_embeddings = None
+        box_embeddings = None
+        
         if with_points:
             assert 'point_coords' in instances
             coords = instances.point_coords
@@ -161,4 +184,22 @@ class SAMPromptEncoder(BaseModule):
             dense_embeddings = self.no_mask_embed.weight.to(device).reshape(1, -1, 1, 1).expand(
                 bs, -1, self.image_embedding_size[0], self.image_embedding_size[1]
             )
+        
+        # Handle text prompts if enabled
+        if with_text and self.use_text_prompt and self.prompt_fusion is not None:
+            # Get text from instances if not provided directly
+            if text is None and hasattr(instances, 'text'):
+                text = instances.text
+            
+            # Fuse text with point/box embeddings using PromptFusion
+            fused_embeddings = self.prompt_fusion(
+                point_embed=point_embeddings,
+                box_embed=box_embeddings,
+                text=text
+            )
+            
+            # If fusion produced embeddings, use them; otherwise use original sparse_embeddings
+            if fused_embeddings is not None:
+                sparse_embeddings = fused_embeddings
+        
         return sparse_embeddings, dense_embeddings

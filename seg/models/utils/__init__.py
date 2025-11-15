@@ -8,3 +8,4 @@ from .offline_video_metrics import vpq_eval, stq
 from .task_router import TaskRouter, TaskType, PromptType
 from .memory_adapter import StreamingMemoryAdapter
 from .prompt_fusion import PromptFusion, TextEncoder
+from .vlm_text_generator import VLMTextGenerator
