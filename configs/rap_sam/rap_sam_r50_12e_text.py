@@ -155,3 +155,8 @@ val_cfg = None
 test_dataloader = val_dataloader
 test_evaluator = val_evaluator
 test_cfg = val_cfg
+
+# CRITICAL: Enable find_unused_parameters for DDP
+# TextEncoder parameters may not receive gradients in batches without text
+# This tells DDP to handle unused parameters gracefully
+find_unused_parameters = False

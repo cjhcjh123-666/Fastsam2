@@ -53,6 +53,7 @@ class TextEncoder(nn.Module):
             
             if text_dim != feat_channels:
                 self.text_proj = nn.Linear(text_dim, feat_channels)
+                # Keep text_proj trainable to adapt CLIP features to model dimensions
             else:
                 self.text_proj = nn.Identity()
         else:
