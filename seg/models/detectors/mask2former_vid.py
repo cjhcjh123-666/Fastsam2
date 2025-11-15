@@ -252,8 +252,31 @@ class Mask2formerVideo(SingleStageDetector):
                     [batch_data_samples[idx][frame_id] for idx in range(bs)], results_list_img
                 )):
                     if 'ins_results' in pred_results:
-                        pred_results['ins_results']['instances_id'] = matched_instance_ids
-                        data_sample.pred_track_instances = pred_results['ins_results']
+                        ins_results = pred_results['ins_results']
+                        num_instances = len(ins_results)
+                        
+                        # Create instance IDs tensor matching the number of instances
+                        # panoptic_fusion_head.predict may filter/add instances, so we need to handle mismatches
+                        if num_instances == len(matched_instance_ids):
+                            # Perfect match: all instances are matched
+                            ins_results.instances_id = matched_instance_ids
+                        else:
+                            # Mismatch: create a tensor with -1 for all instances
+                            # This handles cases where fusion head adds/filters instances
+                            instance_ids = torch.full(
+                                (num_instances,), 
+                                -1, 
+                                dtype=matched_instance_ids.dtype if len(matched_instance_ids) > 0 else torch.long, 
+                                device=matched_instance_ids.device if len(matched_instance_ids) > 0 else 'cpu'
+                            )
+                            # Try to assign IDs to the first N instances (assuming order is preserved)
+                            # This is a best-effort approach since we don't know the exact mapping
+                            if len(matched_instance_ids) > 0:
+                                num_to_set = min(len(matched_instance_ids), num_instances)
+                                instance_ids[:num_to_set] = matched_instance_ids[:num_to_set]
+                            ins_results.instances_id = instance_ids
+                        
+                        data_sample.pred_track_instances = ins_results
             
             results = batch_data_samples
         
@@ -363,6 +386,31 @@ class Mask2formerVideo(SingleStageDetector):
                 - matched_instance_ids: Corresponding GT instance IDs [N_matched]
         """
         from scipy.optimize import linear_sum_assignment
+        
+        # Convert BitmapMasks to tensor if needed
+        if not isinstance(gt_masks, torch.Tensor):
+            # gt_masks is BitmapMasks object, convert to tensor
+            device = pred_masks.device if isinstance(pred_masks, torch.Tensor) else 'cpu'
+            gt_masks = gt_masks.to_tensor(dtype=torch.bool, device=device).float()
+        
+        # Ensure GT masks and pred masks have the same spatial dimensions
+        if gt_masks.shape[-2:] != pred_masks.shape[-2:]:
+            # Resize GT masks to match pred masks size
+            pred_h, pred_w = pred_masks.shape[-2:]
+            # F.interpolate expects [B, C, H, W] format
+            if len(gt_masks.shape) == 3:
+                # [N_gt, H, W] -> [N_gt, 1, H, W]
+                gt_masks = gt_masks.unsqueeze(1)
+            gt_masks = F.interpolate(
+                gt_masks,
+                size=(pred_h, pred_w),
+                mode='bilinear',
+                align_corners=False
+            )
+            # Remove channel dimension: [N_gt, 1, H, W] -> [N_gt, H, W]
+            if gt_masks.shape[1] == 1:
+                gt_masks = gt_masks.squeeze(1)
+            gt_masks = (gt_masks > 0.5).float()  # Binarize after interpolation
         
         # Compute IoU matrix: [N_gt, N_pred]
         gt_masks_flat = gt_masks.flatten(1).float()  # [N_gt, H*W]

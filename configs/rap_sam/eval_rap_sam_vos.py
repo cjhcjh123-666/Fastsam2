@@ -7,11 +7,11 @@ from mmdet.models import BatchFixedSizePad
 from mmengine.dataset import DefaultSampler
 from seg.models.data_preprocessor.vidseg_data_preprocessor import VideoSegDataPreprocessor
 from seg.evaluation.metrics.vos_metric import VOSMetric
-from mmcv.transforms import LoadImageFromFile, RandomResize
-from mmdet.datasets.transforms import RandomFlip, PackDetInputs, Resize
-from seg.datasets.davis import DAVISDataset
-from seg.datasets.pipelines.loading import LoadMultiImagesDirect
-from seg.datasets.pipelines.loading import LoadAnnotations as LoadVOSAnnotations
+from mmcv import TransformBroadcaster, LoadImageFromFile
+from mmdet.datasets.transforms import Resize, PackDetInputs
+from seg.datasets.davis import DAVIS
+from seg.datasets.pipelines.loading import LoadVideoSegAnnotations
+from seg.datasets.pipelines.formatting import PackVidSegInputs
 
 with read_base():
     from .._base_.default_runtime import *
@@ -44,20 +44,21 @@ data_preprocessor = dict(
 backend_args = None
 test_pipeline = [
     dict(
-        type=LoadMultiImagesDirect,
-        to_float32=False,
-        backend_args=backend_args
+        type=TransformBroadcaster,
+        transforms=[
+            dict(type=LoadImageFromFile, backend_args=backend_args),
+            dict(type=Resize, scale=(640, 480), keep_ratio=True),
+            dict(
+                type=LoadVideoSegAnnotations,
+                with_bbox=True,
+                with_label=True,
+                with_mask=True,
+                with_seg=False,
+                backend_args=backend_args
+            ),
+        ]
     ),
-    dict(
-        type=LoadVOSAnnotations,
-        with_bbox=True,
-        with_label=True,
-        with_mask=True,
-        with_track=True,  # 加载 instance_ids
-        backend_args=backend_args
-    ),
-    dict(type=Resize, scale=(640, 480), keep_ratio=True),
-    dict(type=PackDetInputs)
+    dict(type=PackVidSegInputs)
 ]
 
 # DAVIS 2017 验证集配置
@@ -68,12 +69,13 @@ val_dataloader = dict(
     drop_last=False,
     sampler=dict(type=DefaultSampler, shuffle=False),
     dataset=dict(
-        type=DAVISDataset,
-        data_root='data/davis/',
+        type=DAVIS,
+        dataset_version='2017',
+        data_root='/mnt/chenjiahui/Fastsam2-main/data/DAVIS/',
         ann_file='ImageSets/2017/val.txt',
         data_prefix=dict(
-            img_path='JPEGImages/480p/',
-            gt_seg_map_path='Annotations/480p/'
+            img='JPEGImages/480p/',
+            ann='Annotations/480p/'
         ),
         pipeline=test_pipeline,
         test_mode=True,
@@ -89,6 +91,10 @@ val_evaluator = dict(
     outfile_prefix='./work_dirs/vos_results'
 )
 test_evaluator = val_evaluator
+
+# Val config (required by MMEngine)
+val_cfg = dict(type='mmengine.runner.ValLoop')
+test_cfg = dict(type='mmengine.runner.TestLoop')
 
 # 更新模型配置为 VOS 模式
 model.update(
